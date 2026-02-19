@@ -1,0 +1,15 @@
+mcp-crawl4ai
+swarm-ide
+supabase
+crawl4ai-example
+sample
+.DS_Store
+.venv
+.ruff_cache
+
+node_modules/
+__pycache__/
+*.pyc
+.env
+.env.local
+*.log
