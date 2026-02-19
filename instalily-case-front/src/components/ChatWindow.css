@@ -126,46 +126,63 @@
 .thinking-step-list {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
 }
 
 .thinking-step-row {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
+  gap: 12px;
 }
 
 .thinking-step-icon {
-  width: 20px;
-  height: 20px;
-  border-radius: 999px;
-  border: 1px solid #9ca3af;
-  color: #6b7280;
-  font-size: 12px;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
   display: flex;
   align-items: center;
   justify-content: center;
   margin-top: 2px;
   flex: 0 0 auto;
   position: relative;
+  font-size: 10px;
+  font-weight: 600;
 }
 
 .thinking-step-done {
-  border-color: #9ca3af;
-  background: #f9fafb;
+  background: #e5e7eb;
+}
+
+.thinking-step-done::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 2px;
+  background: #6b7280;
 }
 
 .thinking-step-running {
-  border-color: #9ca3af;
-  background: #ffffff;
+  background: #f3f4f6;
+  animation: pulse 1.5s ease-in-out infinite;
 }
 
 .thinking-step-running::before {
   content: "";
   width: 6px;
   height: 6px;
-  border-radius: 999px;
-  background: #6b7280;
+  border-radius: 2px;
+  background: #9ca3af;
+  animation: blink 1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
 }
 
 .thinking-step-content {
@@ -173,19 +190,19 @@
 }
 
 .thinking-step-text {
-  color: #374151;
+  color: #4b5563;
   font-size: 13px;
-  line-height: 1.45;
-  margin-bottom: 6px;
+  line-height: 1.5;
 }
 
 .thinking-domain-pill {
   display: inline-block;
-  padding: 3px 10px;
-  border-radius: 999px;
+  padding: 2px 8px;
+  border-radius: 4px;
   background: #f3f4f6;
   color: #6b7280;
-  font-size: 12px;
+  font-size: 11px;
+  margin-top: 4px;
 }
 
 .thinking-step-detail {

@@ -308,7 +308,7 @@ function ChatWindow({ messages, setMessages, onJumpToMessage, onSourcesDrawerCha
                           {message.thinkingSteps.map((step, i) => (
                             <div className="thinking-step-row" key={`step-${i}`}>
                               <div className={`thinking-step-icon thinking-step-${step.status || "running"}`}>
-                                {step.status === "done" ? "✓" : ""}
+                                {step.status === "done" ? "" : ""}
                               </div>
                               <div className="thinking-step-content">
                                 <div className="thinking-step-text">{step.text}</div>
