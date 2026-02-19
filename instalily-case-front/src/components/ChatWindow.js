@@ -84,7 +84,20 @@ function ChatWindow({ messages, setMessages, onJumpToMessage, onSourcesDrawerCha
             if (thinkingSteps.length === 0) {
               thinkingText += chunk;
             } else {
-              const lastIdx = thinkingSteps.length - 1;
+              let lastIdx = -1;
+              for (let i = thinkingSteps.length - 1; i >= 0; i -= 1) {
+                if ((thinkingSteps[i]?.status || "running") === "running") {
+                  lastIdx = i;
+                  break;
+                }
+              }
+              if (lastIdx < 0) {
+                thinkingSteps = [
+                  ...thinkingSteps,
+                  { status: "running", text: "Thinking", domain: "", detail: "" },
+                ];
+                lastIdx = thinkingSteps.length - 1;
+              }
               const curr = thinkingSteps[lastIdx] || { status: "running", text: "Thinking", domain: "" };
               thinkingSteps = [
                 ...thinkingSteps.slice(0, lastIdx),

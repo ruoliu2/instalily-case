@@ -14,6 +14,11 @@ function App() {
   const [isSourcesOpen, setIsSourcesOpen] = useState(false);
   const jumpToMessageRef = useRef(null);
   const lastNewChatClickAtRef = useRef(0);
+  const chatsRef = useRef(chats);
+
+  useEffect(() => {
+    chatsRef.current = chats;
+  }, [chats]);
 
   const activeChat = chats.find((chat) => chat.id === activeChatId);
   const activeMessages = activeChat ? activeChat.messages : [];
@@ -26,13 +31,24 @@ function App() {
     }
   }, [activeMessages.length]);
 
+  const localFallbackTitle = (messages = []) => {
+    const first = messages.find((m) => (m?.content || "").trim())?.content || "";
+    const cleaned = first.replace(/\s+/g, " ").trim();
+    if (!cleaned) return "New Chat";
+    return cleaned.slice(0, 36) + (cleaned.length > 36 ? "..." : "");
+  };
+
   const maybeFinalizeChatTitle = async (chatId) => {
-    const chat = chats.find((c) => c.id === chatId);
+    const chat = chatsRef.current.find((c) => c.id === chatId);
     if (!chat) return;
     if (chat.title !== "Welcome Chat" && chat.title !== "New Chat") return;
     if (!Array.isArray(chat.messages) || chat.messages.length === 0) return;
 
-    const title = await summarizeChatTitle(chat.messages);
+    const llmTitle = await summarizeChatTitle(chat.messages);
+    const title =
+      llmTitle && llmTitle !== "New Chat"
+        ? llmTitle
+        : localFallbackTitle(chat.messages);
     setChats((prevChats) =>
       prevChats.map((c) => {
         if (c.id !== chatId) return c;

@@ -435,7 +435,14 @@ class MainAgent:
             "Write a clear final answer with sources when available."
         )
         saw_output = False
+        synthesis_started = False
         try:
+            yield {
+                "type": "thinking_step",
+                "status": "running",
+                "text": "Synthesizing final answer",
+            }
+            synthesis_started = True
             stream = self.client.responses.create(
                 model=settings.openai_model,
                 instructions=SYSTEM_TEMPLATE,
@@ -455,6 +462,13 @@ class MainAgent:
                     if delta:
                         saw_output = True
                         final_text += delta
+                        if synthesis_started:
+                            yield {
+                                "type": "thinking_step",
+                                "status": "done",
+                                "text": "Synthesizing final answer",
+                            }
+                            synthesis_started = False
                         yield {"type": "token", "content": delta}
                 elif etype == "response.error":
                     err = event.model_dump() if hasattr(event, "model_dump") else {}
@@ -462,6 +476,13 @@ class MainAgent:
                     yield {"type": "token", "content": f"\n\nError: {msg}"}
         except Exception:
             pass
+        finally:
+            if synthesis_started:
+                yield {
+                    "type": "thinking_step",
+                    "status": "done",
+                    "text": "Synthesizing final answer",
+                }
 
         if not saw_output:
             if not final_text:
