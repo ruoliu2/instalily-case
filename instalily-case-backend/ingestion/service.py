@@ -138,7 +138,7 @@ class IngestionService:
         self.store.reconcile_frontier_for_resume()
 
         for s in self.cfg.seed_urls:
-            self.enqueue(s, force_requeue=True)
+            self.enqueue(s, force_requeue=self.cfg.requeue_seeds_on_start)
 
         async with AsyncWebCrawler(verbose=False) as crawler:
             workers = [

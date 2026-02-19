@@ -31,7 +31,7 @@ function Sidebar({ chats, activeChatId, onSelectChat, onNewChat, onDeleteChat })
                 }}
                 title="Delete chat"
               >
-                🗑️
+                ×
               </button>
             </div>
           ))

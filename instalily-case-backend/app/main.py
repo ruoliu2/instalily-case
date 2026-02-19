@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
+import signal
+import subprocess
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import uvicorn
 
 from .agent import MainAgent
@@ -10,7 +16,10 @@ from .config import settings
 from .models import (
     ChatRequest,
     ChatResponse,
+    ChatTitleRequest,
+    ChatTitleResponse,
     CompatibilityToolRequest,
+    LiveCrawlToolRequest,
     SiteSearchToolRequest,
 )
 from .retrieval import SampleRepository
@@ -33,14 +42,27 @@ def health() -> dict:
     return {
         "ok": True,
         "sample_pages_loaded": len(repo.pages),
-        "llm_enabled": settings.use_llm,
         "data_mode": settings.data_mode,
     }
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest) -> ChatResponse:
-    return agent.run(payload.message)
+    return agent.run_sync_from_stream(payload.message)
+
+
+@app.post("/chat/title", response_model=ChatTitleResponse)
+def chat_title(payload: ChatTitleRequest) -> ChatTitleResponse:
+    return ChatTitleResponse(title=agent.summarize_title(payload.history))
+
+
+@app.post("/chat/stream")
+def chat_stream(payload: ChatRequest) -> StreamingResponse:
+    def event_stream():
+        for event in agent.run_stream(payload.message):
+            yield json.dumps(event, ensure_ascii=True) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 
 @app.get("/tools")
@@ -73,5 +95,71 @@ def search_site(payload: SiteSearchToolRequest) -> dict:
     }
 
 
+@app.post("/tools/crawl-live")
+def crawl_live(payload: LiveCrawlToolRequest) -> dict:
+    docs = tools.crawl_partselect_live(
+        url=payload.url,
+        model_number=payload.model_number,
+        query=payload.query,
+        max_pages=payload.max_pages,
+    )
+    return {
+        "data_mode": settings.data_mode,
+        "count": len(docs),
+        "results": [d.model_dump() for d in docs],
+    }
+
+
 def run_server():
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("APP_PORT", os.getenv("PORT", "8000")))
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=settings.backend_reload,
+    )
+
+
+def run_server_dev():
+    port = int(os.getenv("APP_PORT", os.getenv("PORT", "8000")))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True)
+
+
+def run_server_prod():
+    port = int(os.getenv("APP_PORT", os.getenv("PORT", "8000")))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=False)
+
+
+def stop_server():
+    port = int(os.getenv("APP_PORT", os.getenv("PORT", "8000")))
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        print("Could not stop server: `lsof` is not installed.")
+        return
+
+    pids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not pids:
+        print(f"No listening process found on port {port}.")
+        return
+
+    for pid_str in pids:
+        try:
+            os.kill(int(pid_str), signal.SIGTERM)
+            print(f"Stopped process {pid_str} on port {port}.")
+        except ProcessLookupError:
+            continue
+
+
+def start_mcp():
+    cmd = [settings.mcp_browser_command, *settings.mcp_browser_args]
+    print(f"Starting MCP browser: {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, check=True)
+    except KeyboardInterrupt:
+        pass

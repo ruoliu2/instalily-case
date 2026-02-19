@@ -11,7 +11,7 @@ class IngestionConfig:
     crawl_concurrency: int = int(os.getenv("CRAWL_CONCURRENCY", "12"))
     max_runtime_hours: float = float(os.getenv("MAX_RUNTIME_HOURS", "48"))
     max_pages: int = int(os.getenv("MAX_PAGES", "250000"))
-    frontier_resume_limit: int = int(os.getenv("FRONTIER_RESUME_LIMIT", "200000"))
+    requeue_seeds_on_start: bool = os.getenv("REQUEUE_SEEDS_ON_START", "false").lower() == "true"
     save_markdown: bool = os.getenv("SAVE_MARKDOWN", "false").lower() == "true"
 
     seed_urls: List[str] = field(

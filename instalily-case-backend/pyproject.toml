@@ -12,6 +12,13 @@ dependencies = [
 
 [project.scripts]
 start = "app.main:run_server"
+start-dev = "app.main:run_server_dev"
+start-prod = "app.main:run_server_prod"
+stop = "app.main:stop_server"
+start-mcp = "app.main:start_mcp"
+
+[tool.setuptools]
+packages = ["app", "ingestion"]
 
 [tool.uv]
 package = true

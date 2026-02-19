@@ -3,6 +3,7 @@ import "./App.css";
 import ChatWindow from "./components/ChatWindow";
 import Sidebar from "./components/Sidebar";
 import ChatSummary from "./components/ChatSummary";
+import { summarizeChatTitle } from "./api/api";
 
 function App() {
   const [chats, setChats] = useState([
@@ -25,51 +26,32 @@ function App() {
     }
   }, [activeMessages.length]);
 
-  const summarizeTitle = (text) => {
-    const cleaned = (text || "").replace(/\s+/g, " ").trim();
-    if (!cleaned) return "";
-    const maxLength = 30;
-    let title = cleaned;
-    if (title.length > maxLength) {
-      title = title.substring(0, maxLength) + "...";
-    }
-    return title;
-  };
+  const maybeFinalizeChatTitle = async (chatId) => {
+    const chat = chats.find((c) => c.id === chatId);
+    if (!chat) return;
+    if (chat.title !== "Welcome Chat" && chat.title !== "New Chat") return;
+    if (!Array.isArray(chat.messages) || chat.messages.length === 0) return;
 
-  const generateChatTitleFromMessages = (messages = []) => {
-    const firstUserMessage = messages.find((m) => m.role === "user" && m.content);
-    if (firstUserMessage) {
-      return summarizeTitle(firstUserMessage.content) || "New Chat";
-    }
-    const firstAssistantMessage = messages.find(
-      (m) => m.role === "assistant" && m.content
-    );
-    if (firstAssistantMessage) {
-      return summarizeTitle(firstAssistantMessage.content) || "New Chat";
-    }
-    return "New Chat";
-  };
-
-  const maybeFinalizeChatTitle = (chatId) => {
+    const title = await summarizeChatTitle(chat.messages);
     setChats((prevChats) =>
-      prevChats.map((chat) => {
-        if (chat.id !== chatId) return chat;
-        if (chat.title !== "Welcome Chat" && chat.title !== "New Chat") return chat;
-        if (!chat.messages || chat.messages.length === 0) return chat;
-        return {
-          ...chat,
-          title: generateChatTitleFromMessages(chat.messages),
-        };
+      prevChats.map((c) => {
+        if (c.id !== chatId) return c;
+        if (c.title !== "Welcome Chat" && c.title !== "New Chat") return c;
+        if (!Array.isArray(c.messages) || c.messages.length === 0) return c;
+        return { ...c, title };
       })
     );
   };
 
   const handleSetMessages = (newMessages) => {
-    const messages = typeof newMessages === "function" ? newMessages(activeMessages) : newMessages;
-    
     setChats((prevChats) =>
       prevChats.map((chat) => {
         if (chat.id === activeChatId) {
+          const currentMessages = Array.isArray(chat.messages) ? chat.messages : [];
+          const messages =
+            typeof newMessages === "function"
+              ? newMessages(currentMessages)
+              : newMessages;
           return { ...chat, messages };
         }
         return chat;
@@ -132,6 +114,7 @@ function App() {
         onDeleteChat={handleDeleteChat}
       />
       <ChatWindow
+        chatId={activeChatId}
         messages={activeMessages}
         setMessages={handleSetMessages}
         onJumpToMessage={jumpToMessageRef}

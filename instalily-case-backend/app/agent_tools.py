@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from typing import List
+from urllib.parse import parse_qs, urlparse
 
 from .config import settings
+from .mcp_browser import MCPBrowserRunner
 from .models import CompatibilityResult, RetrievedDoc
 from .retrieval import SampleRepository
 
@@ -48,6 +51,23 @@ class AgentToolbox:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "crawl_partselect_live",
+                    "description": "Live crawl PartSelect pages for fresh context. Use when indexed DB results are missing or user asks for latest/live page checks.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string"},
+                            "model_number": {"type": "string"},
+                            "query": {"type": "string"},
+                            "max_pages": {"type": "integer", "minimum": 1, "maximum": 5},
+                        },
+                        "required": ["url"],
+                    },
+                },
+            },
         ]
 
     def check_part_compatibility(
@@ -65,6 +85,29 @@ class AgentToolbox:
             if docs:
                 return docs
         return self.repo.retrieve(query, k=limit)
+
+    def crawl_partselect_live(
+        self, url: str, model_number: str = "", query: str = "", max_pages: int = 2
+    ) -> List[RetrievedDoc]:
+        if not settings.mcp_browser_enabled:
+            raise RuntimeError("MCP browser is required. Set MCP_BROWSER_ENABLED=true.")
+        resolved_query = self._extract_query_hint(url, model_number, query)
+        runner = MCPBrowserRunner(
+            command=settings.mcp_browser_command,
+            args=settings.mcp_browser_args,
+        )
+        docs = asyncio.run(
+            runner.run_live_lookup(url=url, query=resolved_query, max_pages=max(1, min(max_pages, 5)))
+        )
+        return [
+            RetrievedDoc(
+                url=str(d.get("url") or url),
+                title=str(d.get("title") or "Live MCP source"),
+                text=str(d.get("text") or "")[:4000],
+                score=float(d.get("score") or 0.5),
+            )
+            for d in docs
+        ]
 
     def _check_compatibility_supabase(
         self, model_number: str, partselect_number: str
@@ -153,3 +196,23 @@ class AgentToolbox:
                 )
             )
         return docs
+
+    def _extract_query_hint(self, url: str, model_number: str = "", query: str = "") -> str:
+        direct = (query or "").strip()
+        if direct:
+            return direct
+        model = re.sub(r"[^A-Za-z0-9]", "", (model_number or "").upper())
+        if model:
+            return model
+        try:
+            parsed = urlparse(url or "")
+            qs = parse_qs(parsed.query)
+            for key in ("SearchTerm", "searchTerm", "q", "query"):
+                values = qs.get(key) or []
+                if values:
+                    raw = str(values[0]).strip()
+                    if raw:
+                        return raw
+        except Exception:
+            return ""
+        return ""

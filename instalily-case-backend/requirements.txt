@@ -5,3 +5,4 @@ python-dotenv==1.2.1
 openai==2.21.0
 crawl4ai==0.8.0
 psycopg[binary]==3.2.13
+mcp==1.26.0

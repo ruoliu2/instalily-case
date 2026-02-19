@@ -95,10 +95,13 @@
   background: none;
   border: none;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 18px;
+  font-weight: 300;
+  color: #9ca3af;
   opacity: 0;
-  transition: opacity 0.2s;
-  padding: 4px;
+  transition: opacity 0.2s, color 0.2s;
+  padding: 4px 8px;
+  line-height: 1;
 }
 
 .chat-item:hover .delete-btn {
@@ -106,5 +109,5 @@
 }
 
 .delete-btn:hover {
-  transform: scale(1.1);
+  color: #6b7280;
 }

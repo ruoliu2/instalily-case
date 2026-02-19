@@ -10,9 +10,18 @@ class ChatRequest(BaseModel):
     history: List[dict] = Field(default_factory=list)
 
 
+class ChatTitleRequest(BaseModel):
+    history: List[dict] = Field(default_factory=list)
+
+
+class ChatTitleResponse(BaseModel):
+    title: str
+
+
 class Citation(BaseModel):
     url: str
     title: str = ""
+    snippet: str = ""
 
 
 class ToolTrace(BaseModel):
@@ -51,3 +60,10 @@ class CompatibilityToolRequest(BaseModel):
 class SiteSearchToolRequest(BaseModel):
     query: str = Field(min_length=2)
     limit: int = Field(default=6, ge=1, le=10)
+
+
+class LiveCrawlToolRequest(BaseModel):
+    url: str = Field(min_length=8)
+    model_number: str = ""
+    query: str = ""
+    max_pages: int = Field(default=2, ge=1, le=5)

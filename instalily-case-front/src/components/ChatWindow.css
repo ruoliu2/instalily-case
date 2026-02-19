@@ -54,7 +54,7 @@
 .message-wrapper {
   display: flex;
   flex-direction: column;
-  max-width: 80%;
+  max-width: 86%;
   transition: background-color 0.3s;
 }
 
@@ -75,6 +75,129 @@
   align-items: flex-start;
 }
 
+.thinking-panel {
+  width: 100%;
+  margin: 4px 0 14px 0;
+}
+
+.thinking-meta-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.thinking-toggle {
+  width: 100%;
+  border: none;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+
+.thinking-title {
+  font-size: 12px;
+  color: #5f6675;
+  font-weight: 500;
+}
+
+.thinking-domain-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+
+.thinking-domain {
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.thinking-body {
+  border-left: 2px solid #e5e7eb;
+  padding-left: 10px;
+  color: #9ca3af;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.thinking-step-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.thinking-step-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.thinking-step-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1px solid #9ca3af;
+  color: #6b7280;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 2px;
+  flex: 0 0 auto;
+  position: relative;
+}
+
+.thinking-step-done {
+  border-color: #9ca3af;
+  background: #f9fafb;
+}
+
+.thinking-step-running {
+  border-color: #9ca3af;
+  background: #ffffff;
+}
+
+.thinking-step-running::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #6b7280;
+}
+
+.thinking-step-content {
+  min-width: 0;
+}
+
+.thinking-step-text {
+  color: #374151;
+  font-size: 13px;
+  line-height: 1.45;
+  margin-bottom: 6px;
+}
+
+.thinking-domain-pill {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: #f3f4f6;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.thinking-step-detail {
+  margin-top: 8px;
+  border-left: 2px solid #e5e7eb;
+  padding-left: 10px;
+  color: #9ca3af;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
 .message {
   padding: 14px 18px;
   border-radius: 12px;
@@ -93,21 +216,23 @@
 }
 
 .user-message {
-  background-color: #4b5563;
-  color: #ffffff;
+  background-color: #f3f4f6;
+  color: #111827;
   border-bottom-right-radius: 4px;
 }
 
 .assistant-message {
-  background-color: #f3f4f6;
+  background-color: transparent;
   color: #1f2937;
-  border-bottom-left-radius: 4px;
+  border-radius: 0;
   width: 100%;
   box-sizing: border-box;
+  padding: 0;
+  line-height: 1.7;
 }
 
 .assistant-message a {
-  color: #374151;
+  color: #1f2937;
   text-decoration: underline;
 }
 
@@ -146,7 +271,7 @@
 }
 
 .message-followup {
-  padding: 0 8px;
+  padding: 8px 0 0 0;
 }
 
 .source-pill-row {
@@ -169,11 +294,6 @@
 
 .sources-pill-btn:hover {
   background: #eef2f7;
-}
-
-.sources-pill-icon {
-  font-size: 14px;
-  line-height: 1;
 }
 
 ::-webkit-scrollbar {
