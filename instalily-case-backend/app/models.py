@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     history: List[dict] = Field(default_factory=list)
+    run_id: str = ""
 
 
 class ChatTitleRequest(BaseModel):
@@ -16,6 +17,16 @@ class ChatTitleRequest(BaseModel):
 
 class ChatTitleResponse(BaseModel):
     title: str
+
+
+class CancelRunRequest(BaseModel):
+    run_id: str = Field(min_length=1)
+
+
+class CancelRunResponse(BaseModel):
+    ok: bool
+    run_id: str
+    status: str
 
 
 class Citation(BaseModel):

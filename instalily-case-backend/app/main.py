@@ -14,6 +14,8 @@ from .agent import MainAgent
 from .agent_tools import AgentToolbox
 from .config import settings
 from .models import (
+    CancelRunRequest,
+    CancelRunResponse,
     ChatRequest,
     ChatResponse,
     ChatTitleRequest,
@@ -59,10 +61,20 @@ def chat_title(payload: ChatTitleRequest) -> ChatTitleResponse:
 @app.post("/chat/stream")
 def chat_stream(payload: ChatRequest) -> StreamingResponse:
     def event_stream():
-        for event in agent.run_stream(payload.message):
+        for event in agent.run_stream(payload.message, run_id=payload.run_id):
             yield json.dumps(event, ensure_ascii=True) + "\n"
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@app.post("/chat/cancel", response_model=CancelRunResponse)
+def chat_cancel(payload: CancelRunRequest) -> CancelRunResponse:
+    ok = agent.cancel_run(payload.run_id)
+    return CancelRunResponse(
+        ok=ok,
+        run_id=payload.run_id,
+        status="cancel_requested" if ok else "ignored",
+    )
 
 
 @app.get("/tools")
