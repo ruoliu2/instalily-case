@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import "./ChatWindow.css";
-import { streamAIMessage } from "../api/api";
+import { cancelChatRun, streamAIMessage } from "../api/api";
 import { marked } from "marked";
 
 function ChatWindow({ messages, setMessages, onJumpToMessage, onSourcesDrawerChange, chatId }) {
@@ -10,6 +10,7 @@ function ChatWindow({ messages, setMessages, onJumpToMessage, onSourcesDrawerCha
   const [collapsedThinking, setCollapsedThinking] = useState({});
   const messagesEndRef = useRef(null);
   const messageRefs = useRef({});
+  const activeStreamRef = useRef(null);
 
   const extractDomains = (text) => {
     const matches = (text || "").match(/https?:\/\/[^\s)]+/g) || [];
@@ -39,6 +40,11 @@ function ChatWindow({ messages, setMessages, onJumpToMessage, onSourcesDrawerCha
 
   const handleSend = async () => {
     if (input.trim() !== "") {
+      if (activeStreamRef.current?.controller) {
+        activeStreamRef.current.controller.abort();
+        cancelChatRun(activeStreamRef.current.runId);
+        activeStreamRef.current = null;
+      }
       const thinkingStartedAt = Date.now();
       const userMessage = { role: "user", content: input };
       const assistantMessage = {
@@ -57,6 +63,11 @@ function ChatWindow({ messages, setMessages, onJumpToMessage, onSourcesDrawerCha
       setMessages(newMessages);
       const userQuery = input;
       setInput("");
+      const runId = `${chatId || "chat"}_${Date.now()}_${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+      const controller = new AbortController();
+      activeStreamRef.current = { runId, controller };
       let answerText = "";
       let thinkingText = "";
       let thinkingSteps = [];
@@ -78,7 +89,10 @@ function ChatWindow({ messages, setMessages, onJumpToMessage, onSourcesDrawerCha
       };
 
       try {
-        await streamAIMessage(userQuery, newMessages, {
+        await streamAIMessage(
+          userQuery,
+          newMessages,
+          {
           onThinking: (chunk) => {
             if (!chunk) return;
             if (thinkingSteps.length === 0) {
@@ -112,15 +126,39 @@ function ChatWindow({ messages, setMessages, onJumpToMessage, onSourcesDrawerCha
           onThinkingStep: (evt) => {
             const text = (evt?.text || "").trim();
             if (!text) return;
-            thinkingSteps = [
-              ...thinkingSteps,
-              {
-                status: evt?.status || "running",
-                text,
-                domain: evt?.domain || "",
-                detail: "",
-              },
-            ];
+            const status = evt?.status || "running";
+            const domain = evt?.domain || "";
+            const lastIdx = thinkingSteps.length - 1;
+            const last = lastIdx >= 0 ? thinkingSteps[lastIdx] : null;
+
+            if (status === "done" && last && (last.text || "") === text) {
+              thinkingSteps = [
+                ...thinkingSteps.slice(0, lastIdx),
+                {
+                  ...last,
+                  status: "done",
+                  domain: last.domain || domain,
+                },
+              ];
+            } else if (status === "running" && last && (last.text || "") === text && (last.status || "running") === "running") {
+              thinkingSteps = [
+                ...thinkingSteps.slice(0, lastIdx),
+                {
+                  ...last,
+                  domain: last.domain || domain,
+                },
+              ];
+            } else {
+              thinkingSteps = [
+                ...thinkingSteps,
+                {
+                  status,
+                  text,
+                  domain,
+                  detail: "",
+                },
+              ];
+            }
             updateAssistant();
           },
           onToken: (chunk) => {
@@ -157,12 +195,21 @@ function ChatWindow({ messages, setMessages, onJumpToMessage, onSourcesDrawerCha
               thinkingDurationSeconds: seconds,
             });
           },
-        });
+          },
+          { runId, signal: controller.signal }
+        );
       } catch (error) {
+        if (error?.name === "AbortError") {
+          return;
+        }
         updateAssistant({
           content: `Error connecting to backend stream: ${error.message}`,
           citations: [],
         });
+      } finally {
+        if (activeStreamRef.current?.runId === runId) {
+          activeStreamRef.current = null;
+        }
       }
     }
   };
@@ -193,9 +240,26 @@ function ChatWindow({ messages, setMessages, onJumpToMessage, onSourcesDrawerCha
   }, [isSourcesOpen, onSourcesDrawerChange]);
 
   useEffect(() => {
+    if (activeStreamRef.current?.controller) {
+      const runId = activeStreamRef.current.runId;
+      activeStreamRef.current.controller.abort();
+      cancelChatRun(runId);
+      activeStreamRef.current = null;
+    }
     setIsSourcesOpen(false);
     setActiveSources([]);
   }, [chatId]);
+
+  useEffect(() => {
+    return () => {
+      if (activeStreamRef.current?.controller) {
+        const runId = activeStreamRef.current.runId;
+        activeStreamRef.current.controller.abort();
+        cancelChatRun(runId);
+        activeStreamRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     setCollapsedThinking((prev) => {

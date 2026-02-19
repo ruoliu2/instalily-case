@@ -39,16 +39,20 @@ export const getAIMessage = async (userQuery, conversationHistory = []) => {
 export const streamAIMessage = async (
   userQuery,
   conversationHistory = [],
-  handlers = {}
+  handlers = {},
+  options = {}
 ) => {
+  const runId = options.runId || "";
   const response = await fetch(`${API_BASE_URL}/chat/stream`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
+    signal: options.signal,
     body: JSON.stringify({
       message: userQuery,
       history: conversationHistory,
+      run_id: runId,
     }),
   });
 
@@ -87,6 +91,26 @@ export const streamAIMessage = async (
       if (evt.type === "token" && handlers.onToken) handlers.onToken(evt.content || "");
       if (evt.type === "done" && handlers.onDone) handlers.onDone(evt);
     }
+  }
+};
+
+export const cancelChatRun = async (runId) => {
+  const rid = (runId || "").trim();
+  if (!rid) return { ok: false, status: "ignored" };
+  try {
+    const response = await fetch(`${API_BASE_URL}/chat/cancel`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ run_id: rid }),
+    });
+    if (!response.ok) {
+      return { ok: false, status: `http_${response.status}` };
+    }
+    return await response.json();
+  } catch (error) {
+    return { ok: false, status: "network_error" };
   }
 };
 
