@@ -15,8 +15,7 @@ Behavior:
 
 Tool strategy:
 - Use check_part_compatibility when both model number and part number are present.
-- Use search_partselect_content first for indexed DB context.
-- If indexed context is missing/stale or user explicitly asks for live/latest page checks, use crawl_partselect_live.
+- Use crawl_partselect_live for source-backed answers and live page checks.
 """.strip()
 
 INSTANCE_TEMPLATE = """
@@ -25,7 +24,6 @@ User message:
 
 You can call these tools:
 - check_part_compatibility(model_number, partselect_number)
-- search_partselect_content(query, limit)
 - crawl_partselect_live(url, model_number, query, max_pages)
 
 Instructions:

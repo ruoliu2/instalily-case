@@ -39,23 +39,8 @@ class AgentToolbox:
             {
                 "type": "function",
                 "function": {
-                    "name": "search_partselect_content",
-                    "description": "Search indexed PartSelect website content for context snippets.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string"},
-                            "limit": {"type": "integer", "minimum": 1, "maximum": 10},
-                        },
-                        "required": ["query"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
                     "name": "crawl_partselect_live",
-                    "description": "Live crawl PartSelect pages for fresh context. Use when indexed DB results are missing or user asks for latest/live page checks.",
+                    "description": "Live crawl PartSelect pages for fresh context via MCP browser automation. Prefer this for source-backed answers and model/part lookups.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -151,7 +136,7 @@ class AgentToolbox:
             partselect_number=row[1],
             compatible=True,
             confidence=float(row[2] or 0.9),
-            source_url=row[3],
+            source_url=self._sanitize_source_url(row[3], row[0]),
         )
 
     def _search_supabase(self, query: str, limit: int) -> List[RetrievedDoc]:
@@ -216,3 +201,19 @@ class AgentToolbox:
         except Exception:
             return ""
         return ""
+
+    @staticmethod
+    def _sanitize_source_url(source_url: str | None, model_number: str = "") -> str | None:
+        raw = (source_url or "").strip()
+        model = re.sub(r"[^A-Za-z0-9]", "", (model_number or "").upper())
+        fallback = f"https://www.partselect.com/Models/{model}/" if model else "https://www.partselect.com/"
+        if not raw:
+            return fallback
+        try:
+            parsed = urlparse(raw)
+        except Exception:
+            return fallback
+        host = (parsed.hostname or "").lower()
+        if host.endswith("partselect.com"):
+            return raw
+        return fallback

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from typing import Any, Dict, Generator, List
 
 from openai import OpenAI
@@ -13,6 +14,20 @@ from .prompt_templates import INSTANCE_TEMPLATE, SYSTEM_TEMPLATE
 from .retrieval import SampleRepository
 
 
+class InterruptAgentFlow(Exception):
+    def __init__(self, message: Dict[str, Any]):
+        super().__init__(str(message.get("content", "InterruptAgentFlow")))
+        self.message_payload = message
+
+
+class Submitted(InterruptAgentFlow):
+    pass
+
+
+class LimitsExceeded(InterruptAgentFlow):
+    pass
+
+
 class MainAgent:
     def __init__(self, repo: SampleRepository, tools: AgentToolbox):
         self.repo = repo
@@ -21,6 +36,8 @@ class MainAgent:
         self.client = OpenAI(
             base_url=settings.openai_base_url, api_key=settings.openai_api_key
         )
+        self._cancel_lock = threading.Lock()
+        self._cancelled_runs: set[str] = set()
 
     @staticmethod
     def _ensure_citations(citations: List[Citation]) -> List[Citation]:
@@ -75,6 +92,10 @@ class MainAgent:
                 "right now",
                 "real-time",
                 "real time",
+                "source",
+                "sources",
+                "link",
+                "links",
                 "open ",
                 "check page",
             ]
@@ -116,6 +137,51 @@ class MainAgent:
             return parsed if isinstance(parsed, dict) else {}
         except Exception:
             return {}
+
+    @staticmethod
+    def _doc_is_access_denied(doc: Any) -> bool:
+        title = str(getattr(doc, "title", "") or "").lower()
+        text = str(getattr(doc, "text", "") or "").lower()
+        return "access denied" in title or "access denied" in text
+
+    def _docs_are_access_denied(self, docs: List[Any]) -> bool:
+        return bool(docs) and all(self._doc_is_access_denied(d) for d in docs)
+
+    @staticmethod
+    def _tool_result_check_text(name: str, payload: Dict[str, Any]) -> str:
+        if name == "check_part_compatibility":
+            compatible = bool(payload.get("compatible"))
+            confidence = payload.get("confidence")
+            source = payload.get("source_url")
+            return (
+                f"Result check: compatible={compatible}, confidence={confidence}, "
+                f"source={'present' if source else 'missing'}."
+            )
+        if name == "crawl_partselect_live":
+            if payload.get("error") == "access_denied_by_target":
+                return "Result check: live crawl blocked by target site (Access Denied)."
+            return f"Result check: live crawl returned {int(payload.get('count') or 0)} page(s)."
+        if name == "search_partselect_content":
+            return f"Result check: indexed search returned {int(payload.get('count') or 0)} result(s)."
+        if payload.get("error"):
+            return f"Result check: tool error {payload.get('error')}."
+        return "Result check: tool completed."
+
+    @staticmethod
+    def _tool_context_line(name: str, args: Dict[str, Any], payload: Dict[str, Any]) -> str:
+        args_s = json.dumps(args or {}, ensure_ascii=True)
+        if name == "check_part_compatibility":
+            return (
+                f"- {name} args={args_s} => compatible={bool(payload.get('compatible'))}, "
+                f"confidence={payload.get('confidence')}, source_url={'yes' if payload.get('source_url') else 'no'}"
+            )
+        if name == "crawl_partselect_live":
+            if payload.get("error") == "access_denied_by_target":
+                return f"- {name} args={args_s} => blocked=access_denied_by_target"
+            return f"- {name} args={args_s} => pages={int(payload.get('count') or 0)}"
+        if payload.get("error"):
+            return f"- {name} args={args_s} => error={payload.get('error')}"
+        return f"- {name} args={args_s} => done"
 
     @staticmethod
     def _infer_intent_from_tools(tool_names: List[str]) -> str:
@@ -197,6 +263,28 @@ class MainAgent:
         except Exception:
             return self._fallback_title(history)
 
+    def cancel_run(self, run_id: str) -> bool:
+        rid = (run_id or "").strip()
+        if not rid:
+            return False
+        with self._cancel_lock:
+            self._cancelled_runs.add(rid)
+        return True
+
+    def _is_cancelled(self, run_id: str) -> bool:
+        rid = (run_id or "").strip()
+        if not rid:
+            return False
+        with self._cancel_lock:
+            return rid in self._cancelled_runs
+
+    def _clear_cancelled(self, run_id: str) -> None:
+        rid = (run_id or "").strip()
+        if not rid:
+            return
+        with self._cancel_lock:
+            self._cancelled_runs.discard(rid)
+
     def run_sync_from_stream(self, message: str) -> ChatResponse:
         answer_parts: List[str] = []
         intent = "general_parts_help"
@@ -227,18 +315,70 @@ class MainAgent:
             traces=traces,
         )
 
-    def run_stream(self, message: str) -> Generator[Dict[str, Any], None, None]:
+    def _iter_step_thinking(
+        self,
+        *,
+        user_message: str,
+        step_text: str,
+        tool_name: str = "",
+        tool_args: Dict[str, Any] | None = None,
+    ) -> Generator[str, None, None]:
+        args_text = json.dumps(tool_args or {}, ensure_ascii=True)
+        prompt = (
+            "User request:\n"
+            f"{user_message}\n\n"
+            "Current step:\n"
+            f"{step_text}\n\n"
+            f"Tool name: {tool_name or 'none'}\n"
+            f"Tool args: {args_text}\n"
+            "Write a detailed thinking-style reasoning log for this step."
+        )
+        saw_reasoning = False
+        try:
+            stream = self.client.responses.create(
+                model=settings.openai_model,
+                instructions=SYSTEM_TEMPLATE,
+                input=prompt,
+                stream=True,
+                temperature=0.2,
+                reasoning={"effort": "medium"},
+                timeout=8.0,
+            )
+            for event in stream:
+                etype = getattr(event, "type", "")
+                if etype == "response.reasoning_summary_text.delta":
+                    delta = getattr(event, "delta", "") or ""
+                    if delta:
+                        saw_reasoning = True
+                        yield delta
+                elif etype == "response.output_text.delta":
+                    # Fallback for models that don't emit reasoning summary events.
+                    delta = getattr(event, "delta", "") or ""
+                    if delta and not saw_reasoning:
+                        yield delta
+                        # Keep per-step thinking short and avoid long-running streams.
+                        return
+        except Exception:
+            return
+
+    def run_stream(self, message: str, run_id: str = "") -> Generator[Dict[str, Any], None, None]:
         traces: List[ToolTrace] = [ToolTrace(step="data_mode", detail=settings.data_mode)]
         citations: List[Citation] = []
         tool_names_used: List[str] = []
         used_live_tool = False
+        live_blocked = False
+        live_empty = False
+        compatibility_confirmed = False
         final_text = ""
-        tool_payloads: List[dict] = []
+        n_calls = 0
+        trajectory: List[Dict[str, Any]] = []
+        tool_context_lines: List[str] = []
 
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_TEMPLATE},
             {"role": "user", "content": INSTANCE_TEMPLATE.format(message=message)},
         ]
+        trajectory.extend(messages)
 
         yield {
             "type": "thinking_step",
@@ -246,136 +386,199 @@ class MainAgent:
             "text": "Understanding request",
         }
 
-        for step in range(1, self.step_limit + 1):
-            traces.append(ToolTrace(step="llm_step", detail=str(step)))
-            planning_step_index = step
+        step = 0
+        while True:
+            if self._is_cancelled(run_id):
+                yield {"type": "done", "status": "cancelled", "intent": "general_parts_help", "confidence": 0.0, "citations": [], "traces": [t.model_dump() for t in traces]}
+                self._clear_cancelled(run_id)
+                return
+            try:
+                step += 1
+                if self.step_limit > 0 and n_calls >= self.step_limit:
+                    raise LimitsExceeded(
+                        {
+                            "role": "exit",
+                            "content": "LimitsExceeded",
+                            "extra": {"exit_status": "LimitsExceeded"},
+                        }
+                    )
+                n_calls += 1
+                traces.append(ToolTrace(step="llm_step", detail=str(step)))
 
-            resp = self.client.chat.completions.create(
-                model=settings.openai_model,
-                messages=messages,
-                tools=self.tools.tool_schemas(),
-                tool_choice="auto",
-                temperature=0.2,
-            )
-            assistant_msg = resp.choices[0].message
-            content = assistant_msg.content or ""
-            tool_calls = assistant_msg.tool_calls or []
-
-            if tool_calls:
-                first = tool_calls[0]
-                fn = first.function.name
-                args = self._safe_json_loads(first.function.arguments)
-                # Visible tool-decision trace (not hidden chain-of-thought).
-                plan_text = f"Planning step {planning_step_index}: next tool `{fn}` with args {json.dumps(args, ensure_ascii=True)}"
-            else:
-                plan_text = f"Planning step {planning_step_index}: preparing final response"
-            yield {
-                "type": "thinking_step",
-                "status": "running",
-                "text": f"Planning step {planning_step_index}",
-            }
-
-            assistant_message: Dict[str, Any] = {"role": "assistant", "content": content}
-            if tool_calls:
-                assistant_message["tool_calls"] = [tc.model_dump() for tc in tool_calls]
-            messages.append(assistant_message)
-
-            if not tool_calls:
-                if self._wants_live_lookup(message) and not used_live_tool:
-                    yield {
-                        "type": "thinking_step",
-                        "status": "running",
-                        "text": "Draft answer ready; adding live verification",
-                    }
-                else:
-                    yield {
-                        "type": "thinking_step",
-                        "status": "done",
-                        "text": "No tool call needed; composing final response",
-                    }
-                final_text = content.strip()
-                break
-
-            for tc in tool_calls:
-                name = tc.function.name
-                args = self._safe_json_loads(tc.function.arguments)
-                tool_names_used.append(name)
-                traces.append(ToolTrace(step="tool_call", detail=name))
-                if name in ("crawl_partselect_live", "search_partselect_content"):
-                    yield {
-                        "type": "thinking_step",
-                        "status": "running",
-                        "text": "Running and summarizing web data",
-                        "domain": "www.partselect.com",
-                    }
+                decision_step_text = f"Loop {step}: deciding next action"
                 yield {
                     "type": "thinking_step",
                     "status": "running",
-                    "text": f"Running tool: {name}",
-                    "domain": "www.partselect.com",
+                    "text": decision_step_text,
+                }
+                for chunk in self._iter_step_thinking(
+                    user_message=message,
+                    step_text=decision_step_text,
+                ):
+                    yield {"type": "thinking_token", "content": chunk}
+
+                loop_context = (
+                    "Tool history for this run:\n"
+                    + ("\n".join(tool_context_lines[-8:]) if tool_context_lines else "- none yet")
+                    + "\n\nRules for this step:\n"
+                    + "1) Read tool history before deciding.\n"
+                    + "2) Do not call the same tool with the same args again unless prior result was explicitly insufficient.\n"
+                    + "3) If compatibility and at least one source are already available, answer directly."
+                )
+                resp = self.client.chat.completions.create(
+                    model=settings.openai_model,
+                    messages=[*messages, {"role": "system", "content": loop_context}],
+                    tools=self.tools.tool_schemas(),
+                    tool_choice="auto",
+                    temperature=0.2,
+                    timeout=45.0,
+                )
+                assistant_msg = resp.choices[0].message
+                content = assistant_msg.content or ""
+                tool_calls = assistant_msg.tool_calls or []
+                yield {
+                    "type": "thinking_step",
+                    "status": "done",
+                    "text": decision_step_text,
                 }
 
-                if name == "check_part_compatibility":
-                    result = self.tools.check_part_compatibility(
-                        model_number=str(args.get("model_number", "")),
-                        partselect_number=str(args.get("partselect_number", "")),
-                    )
-                    payload = result.model_dump()
-                    if payload.get("source_url"):
-                        citations.append(
-                            Citation(
-                                url=payload["source_url"],
-                                title="Compatibility source",
-                                snippet="Compatibility lookup source page.",
-                            )
-                        )
-                elif name == "search_partselect_content":
-                    docs = self.tools.search_partselect_content(
-                        query=str(args.get("query", message)),
-                        limit=int(args.get("limit", 6)),
-                    )
-                    payload = {"count": len(docs), "results": [d.model_dump() for d in docs]}
-                    for d in docs[:3]:
-                        citations.append(
-                            Citation(
-                                url=d.url,
-                                title=d.title or d.url,
-                                snippet=self._citation_snippet(d.text),
-                            )
-                        )
-                elif name == "crawl_partselect_live":
-                    used_live_tool = True
-                    docs = self.tools.crawl_partselect_live(
-                        url=str(args.get("url", "https://www.partselect.com/")),
-                        model_number=str(args.get("model_number", "")),
-                        query=str(args.get("query", message)),
-                        max_pages=int(args.get("max_pages", 2)),
-                    )
-                    payload = {"count": len(docs), "results": [d.model_dump() for d in docs]}
-                    for d in docs[:3]:
-                        citations.append(
-                            Citation(
-                                url=d.url,
-                                title=d.title or d.url,
-                                snippet=self._citation_snippet(d.text),
-                            )
-                        )
-                else:
-                    payload = {"error": f"unknown_tool:{name}"}
-                tool_payloads.append({"tool": name, "args": args, "result": payload})
+                assistant_message: Dict[str, Any] = {"role": "assistant", "content": content}
+                if tool_calls:
+                    assistant_message["tool_calls"] = [tc.model_dump() for tc in tool_calls]
+                messages.append(assistant_message)
+                trajectory.append(assistant_message)
 
-                messages.append(
-                    {
+                if not tool_calls:
+                    final_text = content.strip()
+                    raise Submitted(
+                        {
+                            "role": "exit",
+                            "content": "Submitted",
+                            "extra": {"exit_status": "Submitted"},
+                        }
+                    )
+
+                for i, tc in enumerate(tool_calls, start=1):
+                    if self._is_cancelled(run_id):
+                        yield {"type": "done", "status": "cancelled", "intent": "general_parts_help", "confidence": 0.0, "citations": [], "traces": [t.model_dump() for t in traces]}
+                        self._clear_cancelled(run_id)
+                        return
+                    name = tc.function.name
+                    args = self._safe_json_loads(tc.function.arguments)
+                    tool_names_used.append(name)
+                    traces.append(ToolTrace(step="tool_call", detail=name))
+                    tool_step_text = f"Loop {step}: tool {i} `{name}`"
+                    yield {
+                        "type": "thinking_step",
+                        "status": "running",
+                        "text": tool_step_text,
+                        "domain": "www.partselect.com",
+                    }
+                    for chunk in self._iter_step_thinking(
+                        user_message=message,
+                        step_text=tool_step_text,
+                        tool_name=name,
+                        tool_args=args,
+                    ):
+                        yield {"type": "thinking_token", "content": chunk}
+
+                    if name == "check_part_compatibility":
+                        result = self.tools.check_part_compatibility(
+                            model_number=str(args.get("model_number", "")),
+                            partselect_number=str(args.get("partselect_number", "")),
+                        )
+                        payload = result.model_dump()
+                        compatibility_confirmed = bool(payload.get("compatible"))
+                        if payload.get("source_url"):
+                            citations.append(
+                                Citation(
+                                    url=payload["source_url"],
+                                    title="Compatibility source",
+                                    snippet="Compatibility lookup source page.",
+                                )
+                            )
+                    elif name == "search_partselect_content":
+                        docs = self.tools.search_partselect_content(
+                            query=str(args.get("query", message)),
+                            limit=int(args.get("limit", 6)),
+                        )
+                        payload = {"count": len(docs), "results": [d.model_dump() for d in docs]}
+                        for d in docs[:3]:
+                            citations.append(
+                                Citation(
+                                    url=d.url,
+                                    title=d.title or d.url,
+                                    snippet=self._citation_snippet(d.text),
+                                )
+                            )
+                    elif name == "crawl_partselect_live":
+                        used_live_tool = True
+                        docs = self.tools.crawl_partselect_live(
+                            url=str(args.get("url", "https://www.partselect.com/")),
+                            model_number=str(args.get("model_number", "")),
+                            query=str(args.get("query", message)),
+                            max_pages=int(args.get("max_pages", 2)),
+                        )
+                        if self._docs_are_access_denied(docs):
+                            payload = {
+                                "count": 0,
+                                "results": [],
+                                "error": "access_denied_by_target",
+                            }
+                            live_blocked = True
+                            traces.append(ToolTrace(step="tool_error", detail="crawl_partselect_live: access_denied_by_target"))
+                        else:
+                            payload = {"count": len(docs), "results": [d.model_dump() for d in docs]}
+                            live_empty = len(docs) == 0
+                            for d in docs[:3]:
+                                citations.append(
+                                    Citation(
+                                        url=d.url,
+                                        title=d.title or d.url,
+                                        snippet=self._citation_snippet(d.text),
+                                    )
+                                )
+                    else:
+                        payload = {"error": f"unknown_tool:{name}"}
+
+                    tool_message = {
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": json.dumps(payload, ensure_ascii=True),
                     }
-                )
-                yield {
-                    "type": "thinking_step",
-                    "status": "done",
-                    "text": f"Done: {name}",
-                }
+                    messages.append(tool_message)
+                    trajectory.append(tool_message)
+                    tool_context_lines.append(self._tool_context_line(name, args, payload))
+                    check_step_text = f"Loop {step}: tool {i} result check"
+                    yield {
+                        "type": "thinking_step",
+                        "status": "running",
+                        "text": check_step_text,
+                        "domain": "www.partselect.com",
+                    }
+                    yield {
+                        "type": "thinking_token",
+                        "content": self._tool_result_check_text(name, payload),
+                    }
+                    yield {
+                        "type": "thinking_step",
+                        "status": "done",
+                        "text": check_step_text,
+                    }
+                    yield {
+                        "type": "thinking_step",
+                        "status": "done",
+                        "text": tool_step_text,
+                    }
+            except InterruptAgentFlow as e:
+                trajectory.append(e.message_payload)
+                if trajectory[-1].get("role") == "exit":
+                    break
+
+        if self._is_cancelled(run_id):
+            yield {"type": "done", "status": "cancelled", "intent": "general_parts_help", "confidence": 0.0, "citations": [], "traces": [t.model_dump() for t in traces]}
+            self._clear_cancelled(run_id)
+            return
 
         if self._wants_live_lookup(message) and not used_live_tool:
             model_number = self._extract_model_number(message)
@@ -383,12 +586,25 @@ class MainAgent:
             source_url = self._extract_url(message) or "https://www.partselect.com/"
             query = part_number or model_number or message
             traces.append(ToolTrace(step="tool_call", detail="crawl_partselect_live(forced)"))
+            forced_step_text = "Live-check requirement: crawl_partselect_live"
             yield {
                 "type": "thinking_step",
                 "status": "running",
-                "text": "Running tool: crawl_partselect_live (required for live check)",
+                "text": forced_step_text,
                 "domain": "www.partselect.com",
             }
+            for chunk in self._iter_step_thinking(
+                user_message=message,
+                step_text=forced_step_text,
+                tool_name="crawl_partselect_live",
+                tool_args={
+                    "url": source_url,
+                    "model_number": model_number,
+                    "query": query,
+                    "max_pages": 2,
+                },
+            ):
+                yield {"type": "thinking_token", "content": chunk}
             try:
                 docs = self.tools.crawl_partselect_live(
                     url=source_url,
@@ -397,7 +613,13 @@ class MainAgent:
                     max_pages=2,
                 )
                 tool_names_used.append("crawl_partselect_live")
-                if docs:
+                if self._docs_are_access_denied(docs):
+                    live_blocked = True
+                    traces.append(ToolTrace(step="tool_error", detail="crawl_partselect_live(forced): access_denied_by_target"))
+                    final_text = (
+                        (final_text + "\n\n") if final_text else ""
+                    ) + "Live page check failed: PartSelect blocked automated browser access (Access Denied)."
+                elif docs:
                     for d in docs[:3]:
                         citations.append(
                             Citation(
@@ -410,9 +632,31 @@ class MainAgent:
                         (final_text + "\n\n") if final_text else ""
                     ) + f"Live page check pulled {len(docs)} source page(s)."
                 else:
+                    live_empty = True
                     final_text = (
                         (final_text + "\n\n") if final_text else ""
                     ) + "Live page check returned no results."
+                forced_payload = (
+                    {"count": 0, "results": [], "error": "access_denied_by_target"}
+                    if self._docs_are_access_denied(docs)
+                    else {"count": len(docs), "results": [d.model_dump() for d in docs]}
+                )
+                forced_check_step_text = "Live-check requirement: result check"
+                yield {
+                    "type": "thinking_step",
+                    "status": "running",
+                    "text": forced_check_step_text,
+                    "domain": "www.partselect.com",
+                }
+                yield {
+                    "type": "thinking_token",
+                    "content": self._tool_result_check_text("crawl_partselect_live", forced_payload),
+                }
+                yield {
+                    "type": "thinking_step",
+                    "status": "done",
+                    "text": forced_check_step_text,
+                }
             except Exception as exc:
                 traces.append(ToolTrace(step="tool_error", detail=f"crawl_partselect_live(forced): {exc}"))
                 final_text = (
@@ -421,75 +665,19 @@ class MainAgent:
             yield {
                 "type": "thinking_step",
                 "status": "done",
-                "text": "Done: crawl_partselect_live (required)",
+                "text": forced_step_text,
             }
-
-        # Final synthesis uses Responses API so UI can receive native reasoning events.
-        synthesis_prompt = (
-            "User request:\n"
-            f"{message}\n\n"
-            "Tool results (JSON):\n"
-            f"{json.dumps(tool_payloads, ensure_ascii=True)[:12000]}\n\n"
-            "Draft answer (if any):\n"
-            f"{final_text}\n\n"
-            "Write a clear final answer with sources when available."
-        )
-        saw_output = False
-        synthesis_started = False
-        try:
-            yield {
-                "type": "thinking_step",
-                "status": "running",
-                "text": "Synthesizing final answer",
-            }
-            synthesis_started = True
-            stream = self.client.responses.create(
-                model=settings.openai_model,
-                instructions=SYSTEM_TEMPLATE,
-                input=synthesis_prompt,
-                stream=True,
-                temperature=0.2,
-                reasoning={"effort": "medium"},
-            )
-            for event in stream:
-                etype = getattr(event, "type", "")
-                if etype == "response.reasoning_summary_text.delta":
-                    delta = getattr(event, "delta", "") or ""
-                    if delta:
-                        yield {"type": "thinking_token", "content": delta}
-                elif etype == "response.output_text.delta":
-                    delta = getattr(event, "delta", "") or ""
-                    if delta:
-                        saw_output = True
-                        final_text += delta
-                        if synthesis_started:
-                            yield {
-                                "type": "thinking_step",
-                                "status": "done",
-                                "text": "Synthesizing final answer",
-                            }
-                            synthesis_started = False
-                        yield {"type": "token", "content": delta}
-                elif etype == "response.error":
-                    err = event.model_dump() if hasattr(event, "model_dump") else {}
-                    msg = str(err.get("error", "stream_error")) if isinstance(err, dict) else "stream_error"
-                    yield {"type": "token", "content": f"\n\nError: {msg}"}
-        except Exception:
-            pass
-        finally:
-            if synthesis_started:
-                yield {
-                    "type": "thinking_step",
-                    "status": "done",
-                    "text": "Synthesizing final answer",
-                }
-
-        if not saw_output:
-            if not final_text:
-                final_text = "I can help with compatibility, troubleshooting, installation, or part search."
-            yield {"type": "token", "content": final_text}
+        if not final_text:
+            final_text = "I can help with compatibility, troubleshooting, installation, or part search."
+        yield {"type": "token", "content": final_text}
         intent = self._infer_intent_from_tools(tool_names_used) if tool_names_used else self._infer_intent_from_message(message)
         confidence = 0.82 if tool_names_used else 0.62
+        if compatibility_confirmed:
+            confidence = max(confidence, 0.9)
+        if live_blocked:
+            confidence = min(confidence, 0.65)
+        elif live_empty:
+            confidence = min(confidence, 0.72)
         yield {
             "type": "done",
             "intent": intent,
@@ -497,3 +685,4 @@ class MainAgent:
             "citations": [c.model_dump() for c in self._ensure_citations(citations)],
             "traces": [t.model_dump() for t in traces],
         }
+        self._clear_cancelled(run_id)

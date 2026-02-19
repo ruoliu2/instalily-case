@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlencode, urlparse, urlunparse
+from urllib.parse import urlparse
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -29,27 +29,27 @@ class MCPBrowserRunner:
                 docs: list[dict] = []
                 await self._call_tool(session, tools, ["browser_navigate", "navigate"], {"url": url})
                 snapshot = await self._snapshot_text(session, tools)
-                docs.append({"url": url, "title": "Live MCP source", "text": snapshot[:4000], "score": 1.0})
+                docs.append(
+                    {
+                        "url": self._extract_page_url(snapshot) or url,
+                        "title": self._extract_page_title(snapshot) or "Live MCP source",
+                        "text": snapshot[:4000],
+                        "score": 1.0,
+                    }
+                )
 
                 if query and len(docs) < max_pages:
                     submitted = await self._submit_query_via_form(session, tools, query, snapshot)
-                    if not submitted:
-                        search_url = self._build_search_url(query)
-                        await self._call_tool(
-                            session,
-                            tools,
-                            ["browser_navigate", "navigate"],
-                            {"url": search_url},
+                    if submitted:
+                        snapshot2 = await self._snapshot_text(session, tools)
+                        docs.append(
+                            {
+                                "url": self._extract_page_url(snapshot2) or docs[0]["url"],
+                                "title": self._extract_page_title(snapshot2) or "Live MCP search result",
+                                "text": snapshot2[:4000],
+                                "score": 0.9,
+                            }
                         )
-                    snapshot2 = await self._snapshot_text(session, tools)
-                    docs.append(
-                        {
-                            "url": self._build_search_url(query),
-                            "title": "Live MCP search result",
-                            "text": snapshot2[:4000],
-                            "score": 0.9,
-                        }
-                    )
                 return docs[: max(1, min(max_pages, 5))]
 
     async def _submit_query_via_form(
@@ -126,11 +126,18 @@ class MCPBrowserRunner:
         return self._extract_text(result)
 
     @staticmethod
-    def _build_search_url(query: str) -> str:
-        q = query.strip()
-        parsed = urlparse("https://www.partselect.com/Search/")
-        built = parsed._replace(query=urlencode({"SearchTerm": q}))
-        return urlunparse(built)
+    def _extract_page_url(snapshot_text: str) -> str:
+        m = re.search(r"Page URL:\s*(https?://\S+)", snapshot_text or "", flags=re.I)
+        if m:
+            return m.group(1).strip()
+        return ""
+
+    @staticmethod
+    def _extract_page_title(snapshot_text: str) -> str:
+        m = re.search(r"Page Title:\s*(.+)", snapshot_text or "", flags=re.I)
+        if m:
+            return m.group(1).strip()
+        return ""
 
     @staticmethod
     def _tools_map(tool_specs: Any) -> dict[str, Any]:
