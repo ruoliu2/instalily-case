@@ -569,12 +569,6 @@ class MainAgent:
         messages: List[Dict[str, Any]] = self._build_messages(message, history)
         trajectory.extend(messages)
 
-        yield {
-            "type": "thinking_step",
-            "status": "running",
-            "text": "Understanding request",
-        }
-
         step = 0
         while True:
             if self._is_cancelled(run_id):
@@ -600,10 +594,18 @@ class MainAgent:
                     "status": "running",
                     "text": decision_step_text,
                 }
-                yield {
-                    "type": "thinking_token",
-                    "content": self._decision_debug_text(tool_context_lines),
-                }
+                saw_decision_thinking = False
+                for chunk in self._iter_step_thinking(
+                    user_message=message,
+                    step_text=decision_step_text,
+                ):
+                    saw_decision_thinking = True
+                    yield {"type": "thinking_token", "content": chunk}
+                if not saw_decision_thinking:
+                    yield {
+                        "type": "thinking_token",
+                        "content": self._decision_debug_text(tool_context_lines),
+                    }
 
                 loop_context = (
                     "Tool history for this run:\n"
@@ -669,10 +671,20 @@ class MainAgent:
                         "text": tool_step_text,
                         "domain": "www.partselect.com",
                     }
-                    yield {
-                        "type": "thinking_token",
-                        "content": self._tool_call_debug_text(name, args),
-                    }
+                    saw_tool_thinking = False
+                    for chunk in self._iter_step_thinking(
+                        user_message=message,
+                        step_text=tool_step_text,
+                        tool_name=name,
+                        tool_args=args,
+                    ):
+                        saw_tool_thinking = True
+                        yield {"type": "thinking_token", "content": chunk}
+                    if not saw_tool_thinking:
+                        yield {
+                            "type": "thinking_token",
+                            "content": self._tool_call_debug_text(name, args),
+                        }
 
                     if name == "check_part_compatibility":
                         before_urls = set(seen_citation_urls)
