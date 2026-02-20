@@ -1,15 +1,39 @@
-const API_BASE_URL = process.env.REACT_APP_API_URL || "http://localhost:8000";
+import type { ChatMessage, Citation, StreamDoneEvent, ThinkingStep } from "../types/chat";
 
-export const getAIMessage = async (userQuery, conversationHistory = []) => {
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+interface ChatApiResponse {
+  answer: string;
+  intent?: string;
+  confidence?: number;
+  citations?: Citation[];
+}
+
+interface StreamHandlers {
+  onThinking?: (chunk: string) => void;
+  onThinkingStep?: (step: ThinkingStep) => void;
+  onToken?: (chunk: string) => void;
+  onDone?: (evt: StreamDoneEvent) => void;
+}
+
+interface StreamOptions {
+  runId?: string;
+  signal?: AbortSignal;
+}
+
+export const getAIMessage = async (
+  userQuery: string,
+  conversationHistory: ChatMessage[] = []
+): Promise<ChatMessage> => {
   try {
     const response = await fetch(`${API_BASE_URL}/chat`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ 
+      body: JSON.stringify({
         message: userQuery,
-        history: conversationHistory
+        history: conversationHistory,
       }),
     });
 
@@ -17,7 +41,7 @@ export const getAIMessage = async (userQuery, conversationHistory = []) => {
       throw new Error(`API error: ${response.status}`);
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as ChatApiResponse;
 
     return {
       role: "assistant",
@@ -27,21 +51,21 @@ export const getAIMessage = async (userQuery, conversationHistory = []) => {
       citations: Array.isArray(data.citations) ? data.citations : [],
     };
   } catch (error) {
-    console.error("API call failed:", error);
+    const msg = error instanceof Error ? error.message : "Unknown error";
     return {
       role: "assistant",
-      content: `Error connecting to backend. Make sure the backend is running at ${API_BASE_URL}\n\nError: ${error.message}`,
+      content: `Error connecting to backend. Make sure the backend is running at ${API_BASE_URL}\n\nError: ${msg}`,
       citations: [],
     };
   }
 };
 
 export const streamAIMessage = async (
-  userQuery,
-  conversationHistory = [],
-  handlers = {},
-  options = {}
-) => {
+  userQuery: string,
+  conversationHistory: ChatMessage[] = [],
+  handlers: StreamHandlers = {},
+  options: StreamOptions = {}
+): Promise<void> => {
   const runId = options.runId || "";
   const response = await fetch(`${API_BASE_URL}/chat/stream`, {
     method: "POST",
@@ -75,26 +99,32 @@ export const streamAIMessage = async (
     for (const line of lines) {
       const raw = line.trim();
       if (!raw) continue;
-      let evt = null;
+      let evt: Record<string, unknown> | null = null;
       try {
-        evt = JSON.parse(raw);
-      } catch (err) {
+        evt = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
         continue;
       }
-      if (!evt || !evt.type) continue;
+      if (!evt?.type) continue;
+
       if (evt.type === "thinking_step" && handlers.onThinkingStep) {
-        handlers.onThinkingStep(evt);
+        handlers.onThinkingStep({
+          status: String(evt.status || "running"),
+          text: String(evt.text || ""),
+          domain: String(evt.domain || ""),
+          detail: "",
+        });
       }
       if ((evt.type === "thinking" || evt.type === "thinking_token") && handlers.onThinking) {
-        handlers.onThinking(evt.content || "");
+        handlers.onThinking(String(evt.content || ""));
       }
-      if (evt.type === "token" && handlers.onToken) handlers.onToken(evt.content || "");
-      if (evt.type === "done" && handlers.onDone) handlers.onDone(evt);
+      if (evt.type === "token" && handlers.onToken) handlers.onToken(String(evt.content || ""));
+      if (evt.type === "done" && handlers.onDone) handlers.onDone(evt as unknown as StreamDoneEvent);
     }
   }
 };
 
-export const cancelChatRun = async (runId) => {
+export const cancelChatRun = async (runId: string): Promise<{ ok: boolean; status: string }> => {
   const rid = (runId || "").trim();
   if (!rid) return { ok: false, status: "ignored" };
   try {
@@ -108,13 +138,14 @@ export const cancelChatRun = async (runId) => {
     if (!response.ok) {
       return { ok: false, status: `http_${response.status}` };
     }
-    return await response.json();
-  } catch (error) {
+    const data = (await response.json()) as { ok?: boolean; status?: string };
+    return { ok: Boolean(data.ok), status: String(data.status || "unknown") };
+  } catch {
     return { ok: false, status: "network_error" };
   }
 };
 
-export const summarizeChatTitle = async (conversationHistory = []) => {
+export const summarizeChatTitle = async (conversationHistory: ChatMessage[] = []): Promise<string> => {
   try {
     const response = await fetch(`${API_BASE_URL}/chat/title`, {
       method: "POST",
@@ -130,10 +161,9 @@ export const summarizeChatTitle = async (conversationHistory = []) => {
       throw new Error(`Title API error: ${response.status}`);
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as { title?: string };
     return (data?.title || "").trim() || "New Chat";
-  } catch (error) {
-    console.error("Title API call failed:", error);
+  } catch {
     return "New Chat";
   }
 };
