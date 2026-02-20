@@ -330,6 +330,33 @@ class MainAgent:
             return "No prior tool results yet; selecting next action from user request."
         return f"Prior tool context found; using latest result to decide next step: {tool_context_lines[-1]}"
 
+    def _iter_decision_reasoning(
+        self,
+        *,
+        user_message: str,
+        tool_calls: List[Any],
+    ) -> Generator[str, None, None]:
+        if tool_calls:
+            first = tool_calls[0]
+            name = str(getattr(getattr(first, "function", None), "name", "") or "")
+            args_raw = str(getattr(getattr(first, "function", None), "arguments", "") or "")
+            step_text = (
+                "Decision outcome: continue with tool call.\n"
+                f"Selected tool: {name}\n"
+                f"Tool args: {args_raw}\n"
+                "Explain briefly why this tool is needed now."
+            )
+        else:
+            step_text = (
+                "Decision outcome: stop tool use and answer now.\n"
+                "Explain briefly what evidence is sufficient to answer."
+            )
+        for chunk in self._iter_step_thinking(
+            user_message=user_message,
+            step_text=step_text,
+        ):
+            yield chunk
+
     @staticmethod
     def _tool_call_debug_text(name: str, args: Dict[str, Any]) -> str:
         return f"Executing {name} with args={json.dumps(args or {}, ensure_ascii=True)}"
@@ -594,18 +621,6 @@ class MainAgent:
                     "status": "running",
                     "text": decision_step_text,
                 }
-                saw_decision_thinking = False
-                for chunk in self._iter_step_thinking(
-                    user_message=message,
-                    step_text=decision_step_text,
-                ):
-                    saw_decision_thinking = True
-                    yield {"type": "thinking_token", "content": chunk}
-                if not saw_decision_thinking:
-                    yield {
-                        "type": "thinking_token",
-                        "content": self._decision_debug_text(tool_context_lines),
-                    }
 
                 loop_context = (
                     "Tool history for this run:\n"
@@ -620,7 +635,9 @@ class MainAgent:
                     + "use query as a single model or part id (e.g., WDT780SAEM1 or PS3406971), not a phrase.\n"
                     + "5) For pagination/navigation, prefer URLs discovered in this run; do not invent ?page=N paths.\n"
                     + f"6) Progress signal: repeated_no_new_info={repeated_no_new_info}, repeated_same_crawl_call={repeated_same_crawl_call}. "
-                    + "If either is >=2, stop tool calls and provide best final answer from gathered sources."
+                    + "If either is >=2, stop tool calls and provide best final answer from gathered sources.\n"
+                    + "7) After each tool result, explicitly decide continue-vs-stop. "
+                    + "If stopping, provide a brief reason that evidence is sufficient, then answer."
                 )
                 resp = self.client.chat.completions.create(
                     model=settings.openai_model,
@@ -638,6 +655,18 @@ class MainAgent:
                     "status": "done",
                     "text": decision_step_text,
                 }
+                if tool_calls:
+                    first = tool_calls[0]
+                    fn = str(getattr(getattr(first, "function", None), "name", "") or "")
+                    yield {
+                        "type": "thinking_token",
+                        "content": f"Decision: continue with tool `{fn}`.",
+                    }
+                else:
+                    yield {
+                        "type": "thinking_token",
+                        "content": "Decision: stop tool calls; evidence is sufficient.",
+                    }
 
                 assistant_message: Dict[str, Any] = {"role": "assistant", "content": content}
                 if tool_calls:
@@ -671,20 +700,10 @@ class MainAgent:
                         "text": tool_step_text,
                         "domain": "www.partselect.com",
                     }
-                    saw_tool_thinking = False
-                    for chunk in self._iter_step_thinking(
-                        user_message=message,
-                        step_text=tool_step_text,
-                        tool_name=name,
-                        tool_args=args,
-                    ):
-                        saw_tool_thinking = True
-                        yield {"type": "thinking_token", "content": chunk}
-                    if not saw_tool_thinking:
-                        yield {
-                            "type": "thinking_token",
-                            "content": self._tool_call_debug_text(name, args),
-                        }
+                    yield {
+                        "type": "thinking_token",
+                        "content": self._tool_call_debug_text(name, args),
+                    }
 
                     if name == "check_part_compatibility":
                         before_urls = set(seen_citation_urls)
