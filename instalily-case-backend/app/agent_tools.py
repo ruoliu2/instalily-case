@@ -47,7 +47,7 @@ class AgentToolbox:
                             "url": {"type": "string"},
                             "model_number": {"type": "string"},
                             "query": {"type": "string"},
-                            "max_pages": {"type": "integer", "minimum": 1, "maximum": 5},
+                            "max_pages": {"type": "integer", "minimum": 1, "maximum": 6},
                         },
                         "required": ["url"],
                     },
@@ -82,7 +82,7 @@ class AgentToolbox:
             args=settings.mcp_browser_args,
         )
         docs = asyncio.run(
-            runner.run_live_lookup(url=url, query=resolved_query, max_pages=max(1, min(max_pages, 5)))
+            runner.run_live_lookup(url=url, query=resolved_query, max_pages=max(1, min(max_pages, 6)))
         )
         return [
             RetrievedDoc(

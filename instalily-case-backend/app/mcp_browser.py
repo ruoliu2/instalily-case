@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -27,30 +27,66 @@ class MCPBrowserRunner:
                 tools = self._tools_map(tool_specs)
 
                 docs: list[dict] = []
+                seen_urls: set[str] = set()
+                frontier: list[str] = []
+                hard_cap = max(1, min(max_pages, 6))
                 await self._call_tool(session, tools, ["browser_navigate", "navigate"], {"url": url})
                 snapshot = await self._snapshot_text(session, tools)
+                start_url = self._extract_page_url(snapshot) or url
+                seen_urls.add(start_url)
                 docs.append(
                     {
-                        "url": self._extract_page_url(snapshot) or url,
+                        "url": start_url,
                         "title": self._extract_page_title(snapshot) or "Live MCP source",
                         "text": snapshot[:4000],
                         "score": 1.0,
                     }
                 )
+                frontier.extend(self._extract_candidate_links(snapshot, start_url))
 
                 if query and len(docs) < max_pages:
                     submitted = await self._submit_query_via_form(session, tools, query, snapshot)
                     if submitted:
                         snapshot2 = await self._snapshot_text(session, tools)
-                        docs.append(
-                            {
-                                "url": self._extract_page_url(snapshot2) or docs[0]["url"],
-                                "title": self._extract_page_title(snapshot2) or "Live MCP search result",
-                                "text": snapshot2[:4000],
-                                "score": 0.9,
-                            }
-                        )
-                return docs[: max(1, min(max_pages, 5))]
+                        url2 = self._extract_page_url(snapshot2) or docs[0]["url"]
+                        if url2 not in seen_urls:
+                            seen_urls.add(url2)
+                            docs.append(
+                                {
+                                    "url": url2,
+                                    "title": self._extract_page_title(snapshot2) or "Live MCP search result",
+                                    "text": snapshot2[:4000],
+                                    "score": 0.9,
+                                }
+                            )
+                        frontier.extend(self._extract_candidate_links(snapshot2, url2))
+
+                while frontier and len(docs) < hard_cap:
+                    next_url = frontier.pop(0)
+                    if next_url in seen_urls:
+                        continue
+                    if not self._is_partselect_url(next_url):
+                        continue
+                    await self._call_tool(session, tools, ["browser_navigate", "navigate"], {"url": next_url}, swallow=True)
+                    snapshot_n = await self._snapshot_text(session, tools)
+                    curr_url = self._extract_page_url(snapshot_n) or next_url
+                    if curr_url in seen_urls:
+                        continue
+                    seen_urls.add(curr_url)
+                    score = max(0.1, 1.0 - (len(docs) * 0.08))
+                    docs.append(
+                        {
+                            "url": curr_url,
+                            "title": self._extract_page_title(snapshot_n) or "Live MCP discovered page",
+                            "text": snapshot_n[:4000],
+                            "score": score,
+                        }
+                    )
+                    for link in self._extract_candidate_links(snapshot_n, curr_url):
+                        if link not in seen_urls and link not in frontier:
+                            frontier.append(link)
+
+                return docs[:hard_cap]
 
     async def _submit_query_via_form(
         self, session: ClientSession, tools: dict[str, Any], query: str, snapshot_text: str
@@ -138,6 +174,64 @@ class MCPBrowserRunner:
         if m:
             return m.group(1).strip()
         return ""
+
+    @staticmethod
+    def _is_partselect_url(url: str) -> bool:
+        try:
+            host = (urlparse(url).hostname or "").lower()
+            return host.endswith("partselect.com")
+        except Exception:
+            return False
+
+    def _extract_candidate_links(self, snapshot_text: str, base_url: str) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        # Snapshot commonly contains yaml lines like "/url: /Models/..." or full URLs.
+        for m in re.finditer(r"/url:\s*([^\s]+)", snapshot_text or ""):
+            raw = m.group(1).strip().strip('"').strip("'")
+            if raw.startswith("javascript:") or raw.startswith("#"):
+                continue
+            full = self._canonicalize_link(urljoin(base_url, raw))
+            if not full:
+                continue
+            if not self._is_partselect_url(full):
+                continue
+            if full in seen:
+                continue
+            seen.add(full)
+            out.append(full)
+        # Heuristic ordering: prefer model/parts/product pages before hub/legal pages.
+        def score(u: str) -> int:
+            low = u.lower()
+            s = 0
+            if "/ps" in low:
+                s += 10
+            if "/models/" in low:
+                s += 5
+            if "/parts/" in low:
+                s += 4
+            if "start=" in low:
+                s -= 3
+            if any(x in low for x in ["/contact", "/help", "/privacy", "/terms"]):
+                s -= 5
+            if any(x in low for x in ["/user/self-service", "/login", "/cart"]):
+                s -= 8
+            return s
+        out.sort(key=score, reverse=True)
+        return out
+
+    @staticmethod
+    def _canonicalize_link(url: str) -> str:
+        try:
+            p = urlparse(url)
+            if not p.scheme or not p.netloc:
+                return ""
+            # remove fragments and accidental quoted path fragments
+            path = (p.path or "").replace("%22", "").replace('"', "")
+            cleaned = p._replace(path=path, fragment="")
+            return urlunparse(cleaned)
+        except Exception:
+            return ""
 
     @staticmethod
     def _tools_map(tool_specs: Any) -> dict[str, Any]:

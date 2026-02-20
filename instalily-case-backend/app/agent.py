@@ -98,6 +98,15 @@ class MainAgent:
             if model:
                 safe["model_number"] = model
 
+        # If model is known, anchor to canonical model page unless URL is already a model/part detail page.
+        current_url_raw = str(safe.get("url", "")).strip()
+        current_url = current_url_raw.lower()
+        model_token = model.lower()
+        looks_model_page = f"/models/{model_token}/" in current_url or f"/models/{model_token}" in current_url
+        looks_part_page = "/ps" in current_url and current_url.endswith(".htm")
+        if model and not looks_model_page and not looks_part_page:
+            safe["url"] = f"https://www.partselect.com/Models/{model}/"
+
         query = str(safe.get("query", "")).strip()
         if not query:
             part = MainAgent._extract_partselect_number(message)
@@ -107,7 +116,7 @@ class MainAgent:
             mp = int(safe.get("max_pages", 2))
         except Exception:
             mp = 2
-        safe["max_pages"] = max(1, min(mp, 5))
+        safe["max_pages"] = max(1, min(mp, 6))
         return safe
 
     @staticmethod
@@ -209,11 +218,24 @@ class MainAgent:
             if payload.get("error") == "access_denied_by_target":
                 return f"- {name} args={args_s} => blocked=access_denied_by_target"
             hint = MainAgent._crawl_query_hint_from_payload(payload)
+            urls: list[str] = []
+            for r in (payload.get("results", []) if isinstance(payload, dict) else [])[:2]:
+                u = str((r or {}).get("url", "")).strip()
+                if u:
+                    urls.append(u)
             suffix = f", input_hint={hint}" if hint else ""
-            return f"- {name} args={args_s} => pages={int(payload.get('count') or 0)}{suffix}"
+            url_suffix = f", urls={urls}" if urls else ""
+            return f"- {name} args={args_s} => pages={int(payload.get('count') or 0)}{suffix}{url_suffix}"
         if payload.get("error"):
             return f"- {name} args={args_s} => error={payload.get('error')}"
         return f"- {name} args={args_s} => done"
+
+    @staticmethod
+    def _crawl_call_key(args: Dict[str, Any]) -> str:
+        url = str(args.get("url", "")).strip().lower()
+        model = str(args.get("model_number", "")).strip().upper()
+        query = str(args.get("query", "")).strip().upper()
+        return f"url={url}|model={model}|query={query}"
 
     @staticmethod
     def _crawl_query_hint_from_payload(payload: Dict[str, Any]) -> str:
@@ -251,7 +273,25 @@ class MainAgent:
         message: str,
         citations: List[Citation],
         compatibility_confirmed: bool,
+        observed_part_ids: List[str] | None = None,
     ) -> str:
+        parts = [p for p in (observed_part_ids or []) if p]
+        asks_part_list = "list all parts" in message.lower() or "all parts compatible" in message.lower()
+        if asks_part_list and parts:
+            lines = [
+                "I found compatible part IDs from the model pages crawled so far:",
+                "",
+            ]
+            for p in parts[:60]:
+                lines.append(f"- {p}")
+            if len(parts) > 60:
+                lines.append(f"- ...and {len(parts) - 60} more")
+            if citations:
+                lines.extend(["", "Sources:"])
+                for c in citations[:4]:
+                    lines.append(f"- {c.url}")
+            return "\n".join(lines)
+
         if compatibility_confirmed:
             answer = "Yes — compatibility appears confirmed from retrieved sources."
         else:
@@ -270,6 +310,19 @@ class MainAgent:
                 )
             return "\n".join(lines)
         return "I could not gather enough grounded page data in this run. Please retry with a narrower query."
+
+    @staticmethod
+    def _extract_part_ids(text: str) -> List[str]:
+        ids = re.findall(r"\bPS\d{5,}\b", text or "", flags=re.I)
+        seen: set[str] = set()
+        out: List[str] = []
+        for pid in ids:
+            up = pid.upper()
+            if up in seen:
+                continue
+            seen.add(up)
+            out.append(up)
+        return out
 
     @staticmethod
     def _decision_debug_text(tool_context_lines: List[str]) -> str:
@@ -508,6 +561,10 @@ class MainAgent:
         tool_context_lines: List[str] = []
         seen_citation_urls: set[str] = set()
         repeated_no_new_info = 0
+        observed_part_ids: set[str] = set()
+        crawled_urls_in_run: set[str] = set()
+        repeated_same_crawl_call = 0
+        last_crawl_call_key = ""
 
         messages: List[Dict[str, Any]] = self._build_messages(message, history)
         trajectory.extend(messages)
@@ -551,12 +608,17 @@ class MainAgent:
                 loop_context = (
                     "Tool history for this run:\n"
                     + ("\n".join(tool_context_lines[-8:]) if tool_context_lines else "- none yet")
+                    + "\n\nDiscovered URLs in this run:\n"
+                    + ("\n".join([f"- {u}" for u in sorted(crawled_urls_in_run)[:20]]) if crawled_urls_in_run else "- none yet")
                     + "\n\nRules for this step:\n"
                     + "1) Read tool history before deciding.\n"
                     + "2) Do not call the same tool with the same args again unless prior result was explicitly insufficient.\n"
                     + "3) If compatibility and at least one source are already available, answer directly.\n"
                     + "4) If tool history indicates input_hint=search box expects part/model id token, "
-                    + "use query as a single model or part id (e.g., WDT780SAEM1 or PS3406971), not a phrase."
+                    + "use query as a single model or part id (e.g., WDT780SAEM1 or PS3406971), not a phrase.\n"
+                    + "5) For pagination/navigation, prefer URLs discovered in this run; do not invent ?page=N paths.\n"
+                    + f"6) Progress signal: repeated_no_new_info={repeated_no_new_info}, repeated_same_crawl_call={repeated_same_crawl_call}. "
+                    + "If either is >=2, stop tool calls and provide best final answer from gathered sources."
                 )
                 resp = self.client.chat.completions.create(
                     model=settings.openai_model,
@@ -651,6 +713,7 @@ class MainAgent:
                         before_urls = set(seen_citation_urls)
                         used_live_tool = True
                         args = self._normalize_partselect_live_args(args, message)
+                        call_key = self._crawl_call_key(args)
                         docs = self.tools.crawl_partselect_live(
                             url=str(args.get("url", "https://www.partselect.com/")),
                             model_number=str(args.get("model_number", "")),
@@ -673,11 +736,23 @@ class MainAgent:
                                     Citation(
                                         url=d.url,
                                         title=d.title or d.url,
-                                    snippet=self._citation_snippet(d.text),
+                                        snippet=self._citation_snippet(d.text),
+                                    )
                                 )
-                            )
                                 seen_citation_urls.add(str(d.url))
+                            for d in docs:
+                                if str(d.url or "").strip():
+                                    crawled_urls_in_run.add(str(d.url))
+                                for pid in self._extract_part_ids(str(d.text or "")):
+                                    observed_part_ids.add(pid)
+                                for pid in self._extract_part_ids(str(d.url or "")):
+                                    observed_part_ids.add(pid)
                         new_info = seen_citation_urls != before_urls
+                        if call_key == last_crawl_call_key:
+                            repeated_same_crawl_call += 1
+                        else:
+                            repeated_same_crawl_call = 0
+                        last_crawl_call_key = call_key
                     else:
                         payload = {"error": f"unknown_tool:{name}"}
                         new_info = False
@@ -716,11 +791,12 @@ class MainAgent:
                             repeated_no_new_info += 1
                         else:
                             repeated_no_new_info = 0
-                        if repeated_no_new_info >= 2:
+                        if repeated_no_new_info >= 2 or repeated_same_crawl_call >= 2:
                             final_text = self._fallback_from_collected_context(
                                 message=message,
                                 citations=self._ensure_citations(citations),
                                 compatibility_confirmed=compatibility_confirmed,
+                                observed_part_ids=sorted(observed_part_ids),
                             )
                             raise Submitted(
                                 {
@@ -738,6 +814,7 @@ class MainAgent:
                         message=message,
                         citations=self._ensure_citations(citations),
                         compatibility_confirmed=compatibility_confirmed,
+                        observed_part_ids=sorted(observed_part_ids),
                     )
                 trajectory.append(e.message_payload)
                 if trajectory[-1].get("role") == "exit":
@@ -749,6 +826,7 @@ class MainAgent:
             return
 
         saw_output = False
+        allowed_part_ids = sorted(observed_part_ids)
         synthesis_prompt = (
             "User request:\n"
             f"{message}\n\n"
@@ -761,7 +839,11 @@ class MainAgent:
             "Draft answer (if any):\n"
             + (draft_answer or "- none")
             + "\n\n"
-            "Write the final user-facing answer. Be concise and factual."
+            "Allowed part IDs from retrieved pages:\n"
+            + (", ".join(allowed_part_ids[:120]) if allowed_part_ids else "none")
+            + "\n\n"
+            "Write the final user-facing answer. Be concise and factual. "
+            "Do not invent part numbers. Only mention part numbers if they are in Allowed part IDs."
         )
         try:
             stream = self.client.responses.create(

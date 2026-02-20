@@ -77,4 +77,4 @@ class LiveCrawlToolRequest(BaseModel):
     url: str = Field(min_length=8)
     model_number: str = ""
     query: str = ""
-    max_pages: int = Field(default=2, ge=1, le=5)
+    max_pages: int = Field(default=2, ge=1, le=6)
