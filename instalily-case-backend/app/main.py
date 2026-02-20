@@ -50,7 +50,7 @@ def health() -> dict:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest) -> ChatResponse:
-    return agent.run_sync_from_stream(payload.message)
+    return agent.run_sync_from_stream(payload.message, history=payload.history)
 
 
 @app.post("/chat/title", response_model=ChatTitleResponse)
@@ -61,7 +61,9 @@ def chat_title(payload: ChatTitleRequest) -> ChatTitleResponse:
 @app.post("/chat/stream")
 def chat_stream(payload: ChatRequest) -> StreamingResponse:
     def event_stream():
-        for event in agent.run_stream(payload.message, run_id=payload.run_id):
+        for event in agent.run_stream(
+            payload.message, run_id=payload.run_id, history=payload.history
+        ):
             yield json.dumps(event, ensure_ascii=True) + "\n"
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")

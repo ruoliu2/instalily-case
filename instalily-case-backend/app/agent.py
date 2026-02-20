@@ -4,6 +4,7 @@ import json
 import re
 import threading
 from typing import Any, Dict, Generator, List
+from urllib.parse import urlparse
 
 from openai import OpenAI
 
@@ -79,6 +80,35 @@ class MainAgent:
     def _extract_url(message: str) -> str:
         m = re.search(r"(https?://[^\s]+)", message)
         return m.group(1) if m else ""
+
+    @staticmethod
+    def _normalize_partselect_live_args(args: Dict[str, Any], message: str) -> Dict[str, Any]:
+        safe = dict(args or {})
+        raw_url = str(safe.get("url", "")).strip()
+        parsed = urlparse(raw_url) if raw_url else None
+        host = (parsed.hostname or "").lower() if parsed else ""
+
+        # Prevent speculative/offsite deep links; default to PartSelect home and let MCP interact with page UI.
+        if not raw_url or not host.endswith("partselect.com"):
+            safe["url"] = "https://www.partselect.com/"
+
+        model = str(safe.get("model_number", "")).strip().upper()
+        if not model:
+            model = MainAgent._extract_model_number(message)
+            if model:
+                safe["model_number"] = model
+
+        query = str(safe.get("query", "")).strip()
+        if not query:
+            part = MainAgent._extract_partselect_number(message)
+            safe["query"] = part or model or message
+
+        try:
+            mp = int(safe.get("max_pages", 2))
+        except Exception:
+            mp = 2
+        safe["max_pages"] = max(1, min(mp, 5))
+        return safe
 
     @staticmethod
     def _wants_live_lookup(message: str) -> bool:
@@ -178,10 +208,78 @@ class MainAgent:
         if name == "crawl_partselect_live":
             if payload.get("error") == "access_denied_by_target":
                 return f"- {name} args={args_s} => blocked=access_denied_by_target"
-            return f"- {name} args={args_s} => pages={int(payload.get('count') or 0)}"
+            hint = MainAgent._crawl_query_hint_from_payload(payload)
+            suffix = f", input_hint={hint}" if hint else ""
+            return f"- {name} args={args_s} => pages={int(payload.get('count') or 0)}{suffix}"
         if payload.get("error"):
             return f"- {name} args={args_s} => error={payload.get('error')}"
         return f"- {name} args={args_s} => done"
+
+    @staticmethod
+    def _crawl_query_hint_from_payload(payload: Dict[str, Any]) -> str:
+        try:
+            results = payload.get("results", []) if isinstance(payload, dict) else []
+            for r in results[:2]:
+                text = str((r or {}).get("text", "")).lower()
+                if not text:
+                    continue
+                if "part # or model #" in text or "part number or model number" in text:
+                    return "search box expects part/model id token"
+        except Exception:
+            return ""
+        return ""
+
+    @staticmethod
+    def _iter_text_chunks(text: str, target_size: int = 80) -> Generator[str, None, None]:
+        s = (text or "").strip()
+        if not s:
+            return
+        while s:
+            if len(s) <= target_size:
+                yield s
+                return
+            cut = s.rfind(" ", 0, target_size + 1)
+            if cut <= 0:
+                cut = target_size
+            chunk = s[:cut]
+            yield chunk
+            s = s[cut:].lstrip()
+
+    @staticmethod
+    def _fallback_from_collected_context(
+        *,
+        message: str,
+        citations: List[Citation],
+        compatibility_confirmed: bool,
+    ) -> str:
+        if compatibility_confirmed:
+            answer = "Yes — compatibility appears confirmed from retrieved sources."
+        else:
+            answer = "Here is what I found from retrieved sources."
+        if citations:
+            lines = [answer, "", "Sources:"]
+            for c in citations[:4]:
+                lines.append(f"- {c.url}")
+            if "long instruction" in message.lower() or "all parts" in message.lower():
+                lines.extend(
+                    [
+                        "",
+                        "I can provide a full model-specific guide next, but I need one more crawl pass "
+                        "focused on the model parts list sections.",
+                    ]
+                )
+            return "\n".join(lines)
+        return "I could not gather enough grounded page data in this run. Please retry with a narrower query."
+
+    @staticmethod
+    def _decision_debug_text(tool_context_lines: List[str]) -> str:
+        if not tool_context_lines:
+            return "No prior tool results yet; selecting next action from user request."
+        return f"Prior tool context found; using latest result to decide next step: {tool_context_lines[-1]}"
+
+    @staticmethod
+    def _tool_call_debug_text(name: str, args: Dict[str, Any]) -> str:
+        return f"Executing {name} with args={json.dumps(args or {}, ensure_ascii=True)}"
 
     @staticmethod
     def _infer_intent_from_tools(tool_names: List[str]) -> str:
@@ -285,14 +383,16 @@ class MainAgent:
         with self._cancel_lock:
             self._cancelled_runs.discard(rid)
 
-    def run_sync_from_stream(self, message: str) -> ChatResponse:
+    def run_sync_from_stream(
+        self, message: str, history: List[Dict[str, Any]] | None = None
+    ) -> ChatResponse:
         answer_parts: List[str] = []
         intent = "general_parts_help"
         confidence = 0.62
         citations: List[Citation] = []
         traces: List[ToolTrace] = []
 
-        for event in self.run_stream(message):
+        for event in self.run_stream(message, history=history):
             etype = str(event.get("type", ""))
             if etype == "token":
                 answer_parts.append(str(event.get("content", "")))
@@ -315,6 +415,36 @@ class MainAgent:
             traces=traces,
         )
 
+    @staticmethod
+    def _normalize_history(history: List[Dict[str, Any]] | None) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        for item in history or []:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            out.append({"role": role, "content": content})
+        return out
+
+    def _build_messages(self, message: str, history: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
+        hist = self._normalize_history(history)
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_TEMPLATE}]
+        messages.extend(hist)
+
+        # Avoid duplicating the current user turn when frontend already included it in history.
+        if hist and hist[-1]["role"] == "user" and hist[-1]["content"] == message.strip():
+            return messages
+
+        if hist:
+            messages.append({"role": "user", "content": message})
+        else:
+            messages.append({"role": "user", "content": INSTANCE_TEMPLATE.format(message=message)})
+        return messages
+
     def _iter_step_thinking(
         self,
         *,
@@ -331,7 +461,7 @@ class MainAgent:
             f"{step_text}\n\n"
             f"Tool name: {tool_name or 'none'}\n"
             f"Tool args: {args_text}\n"
-            "Write a detailed thinking-style reasoning log for this step."
+            "Write thinking-style reasoning log for this step."
         )
         saw_reasoning = False
         try:
@@ -342,7 +472,7 @@ class MainAgent:
                 stream=True,
                 temperature=0.2,
                 reasoning={"effort": "medium"},
-                timeout=8.0,
+                timeout=6.0,
             )
             for event in stream:
                 etype = getattr(event, "type", "")
@@ -361,7 +491,9 @@ class MainAgent:
         except Exception:
             return
 
-    def run_stream(self, message: str, run_id: str = "") -> Generator[Dict[str, Any], None, None]:
+    def run_stream(
+        self, message: str, run_id: str = "", history: List[Dict[str, Any]] | None = None
+    ) -> Generator[Dict[str, Any], None, None]:
         traces: List[ToolTrace] = [ToolTrace(step="data_mode", detail=settings.data_mode)]
         citations: List[Citation] = []
         tool_names_used: List[str] = []
@@ -373,11 +505,10 @@ class MainAgent:
         n_calls = 0
         trajectory: List[Dict[str, Any]] = []
         tool_context_lines: List[str] = []
+        seen_citation_urls: set[str] = set()
+        repeated_no_new_info = 0
 
-        messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_TEMPLATE},
-            {"role": "user", "content": INSTANCE_TEMPLATE.format(message=message)},
-        ]
+        messages: List[Dict[str, Any]] = self._build_messages(message, history)
         trajectory.extend(messages)
 
         yield {
@@ -411,11 +542,10 @@ class MainAgent:
                     "status": "running",
                     "text": decision_step_text,
                 }
-                for chunk in self._iter_step_thinking(
-                    user_message=message,
-                    step_text=decision_step_text,
-                ):
-                    yield {"type": "thinking_token", "content": chunk}
+                yield {
+                    "type": "thinking_token",
+                    "content": self._decision_debug_text(tool_context_lines),
+                }
 
                 loop_context = (
                     "Tool history for this run:\n"
@@ -423,7 +553,9 @@ class MainAgent:
                     + "\n\nRules for this step:\n"
                     + "1) Read tool history before deciding.\n"
                     + "2) Do not call the same tool with the same args again unless prior result was explicitly insufficient.\n"
-                    + "3) If compatibility and at least one source are already available, answer directly."
+                    + "3) If compatibility and at least one source are already available, answer directly.\n"
+                    + "4) If tool history indicates input_hint=search box expects part/model id token, "
+                    + "use query as a single model or part id (e.g., WDT780SAEM1 or PS3406971), not a phrase."
                 )
                 resp = self.client.chat.completions.create(
                     model=settings.openai_model,
@@ -474,15 +606,13 @@ class MainAgent:
                         "text": tool_step_text,
                         "domain": "www.partselect.com",
                     }
-                    for chunk in self._iter_step_thinking(
-                        user_message=message,
-                        step_text=tool_step_text,
-                        tool_name=name,
-                        tool_args=args,
-                    ):
-                        yield {"type": "thinking_token", "content": chunk}
+                    yield {
+                        "type": "thinking_token",
+                        "content": self._tool_call_debug_text(name, args),
+                    }
 
                     if name == "check_part_compatibility":
+                        before_urls = set(seen_citation_urls)
                         result = self.tools.check_part_compatibility(
                             model_number=str(args.get("model_number", "")),
                             partselect_number=str(args.get("partselect_number", "")),
@@ -497,7 +627,10 @@ class MainAgent:
                                     snippet="Compatibility lookup source page.",
                                 )
                             )
+                            seen_citation_urls.add(str(payload["source_url"]))
+                        new_info = seen_citation_urls != before_urls
                     elif name == "search_partselect_content":
+                        before_urls = set(seen_citation_urls)
                         docs = self.tools.search_partselect_content(
                             query=str(args.get("query", message)),
                             limit=int(args.get("limit", 6)),
@@ -511,8 +644,12 @@ class MainAgent:
                                     snippet=self._citation_snippet(d.text),
                                 )
                             )
+                            seen_citation_urls.add(str(d.url))
+                        new_info = seen_citation_urls != before_urls
                     elif name == "crawl_partselect_live":
+                        before_urls = set(seen_citation_urls)
                         used_live_tool = True
+                        args = self._normalize_partselect_live_args(args, message)
                         docs = self.tools.crawl_partselect_live(
                             url=str(args.get("url", "https://www.partselect.com/")),
                             model_number=str(args.get("model_number", "")),
@@ -535,11 +672,14 @@ class MainAgent:
                                     Citation(
                                         url=d.url,
                                         title=d.title or d.url,
-                                        snippet=self._citation_snippet(d.text),
-                                    )
+                                    snippet=self._citation_snippet(d.text),
                                 )
+                            )
+                                seen_citation_urls.add(str(d.url))
+                        new_info = seen_citation_urls != before_urls
                     else:
                         payload = {"error": f"unknown_tool:{name}"}
+                        new_info = False
 
                     tool_message = {
                         "role": "tool",
@@ -570,7 +710,34 @@ class MainAgent:
                         "status": "done",
                         "text": tool_step_text,
                     }
+                    if name == "crawl_partselect_live":
+                        if not new_info:
+                            repeated_no_new_info += 1
+                        else:
+                            repeated_no_new_info = 0
+                        if repeated_no_new_info >= 2:
+                            final_text = self._fallback_from_collected_context(
+                                message=message,
+                                citations=self._ensure_citations(citations),
+                                compatibility_confirmed=compatibility_confirmed,
+                            )
+                            raise Submitted(
+                                {
+                                    "role": "exit",
+                                    "content": "Submitted",
+                                    "extra": {"exit_status": "Submitted"},
+                                }
+                            )
             except InterruptAgentFlow as e:
+                if (
+                    str(e.message_payload.get("content", "")) == "LimitsExceeded"
+                    and not final_text
+                ):
+                    final_text = self._fallback_from_collected_context(
+                        message=message,
+                        citations=self._ensure_citations(citations),
+                        compatibility_confirmed=compatibility_confirmed,
+                    )
                 trajectory.append(e.message_payload)
                 if trajectory[-1].get("role") == "exit":
                     break
@@ -579,97 +746,10 @@ class MainAgent:
             yield {"type": "done", "status": "cancelled", "intent": "general_parts_help", "confidence": 0.0, "citations": [], "traces": [t.model_dump() for t in traces]}
             self._clear_cancelled(run_id)
             return
-
-        if self._wants_live_lookup(message) and not used_live_tool:
-            model_number = self._extract_model_number(message)
-            part_number = self._extract_partselect_number(message)
-            source_url = self._extract_url(message) or "https://www.partselect.com/"
-            query = part_number or model_number or message
-            traces.append(ToolTrace(step="tool_call", detail="crawl_partselect_live(forced)"))
-            forced_step_text = "Live-check requirement: crawl_partselect_live"
-            yield {
-                "type": "thinking_step",
-                "status": "running",
-                "text": forced_step_text,
-                "domain": "www.partselect.com",
-            }
-            for chunk in self._iter_step_thinking(
-                user_message=message,
-                step_text=forced_step_text,
-                tool_name="crawl_partselect_live",
-                tool_args={
-                    "url": source_url,
-                    "model_number": model_number,
-                    "query": query,
-                    "max_pages": 2,
-                },
-            ):
-                yield {"type": "thinking_token", "content": chunk}
-            try:
-                docs = self.tools.crawl_partselect_live(
-                    url=source_url,
-                    model_number=model_number,
-                    query=query,
-                    max_pages=2,
-                )
-                tool_names_used.append("crawl_partselect_live")
-                if self._docs_are_access_denied(docs):
-                    live_blocked = True
-                    traces.append(ToolTrace(step="tool_error", detail="crawl_partselect_live(forced): access_denied_by_target"))
-                    final_text = (
-                        (final_text + "\n\n") if final_text else ""
-                    ) + "Live page check failed: PartSelect blocked automated browser access (Access Denied)."
-                elif docs:
-                    for d in docs[:3]:
-                        citations.append(
-                            Citation(
-                                url=d.url,
-                                title=d.title or d.url,
-                                snippet=self._citation_snippet(d.text),
-                            )
-                        )
-                    final_text = (
-                        (final_text + "\n\n") if final_text else ""
-                    ) + f"Live page check pulled {len(docs)} source page(s)."
-                else:
-                    live_empty = True
-                    final_text = (
-                        (final_text + "\n\n") if final_text else ""
-                    ) + "Live page check returned no results."
-                forced_payload = (
-                    {"count": 0, "results": [], "error": "access_denied_by_target"}
-                    if self._docs_are_access_denied(docs)
-                    else {"count": len(docs), "results": [d.model_dump() for d in docs]}
-                )
-                forced_check_step_text = "Live-check requirement: result check"
-                yield {
-                    "type": "thinking_step",
-                    "status": "running",
-                    "text": forced_check_step_text,
-                    "domain": "www.partselect.com",
-                }
-                yield {
-                    "type": "thinking_token",
-                    "content": self._tool_result_check_text("crawl_partselect_live", forced_payload),
-                }
-                yield {
-                    "type": "thinking_step",
-                    "status": "done",
-                    "text": forced_check_step_text,
-                }
-            except Exception as exc:
-                traces.append(ToolTrace(step="tool_error", detail=f"crawl_partselect_live(forced): {exc}"))
-                final_text = (
-                    (final_text + "\n\n") if final_text else ""
-                ) + "Live page check failed. Please verify MCP browser settings."
-            yield {
-                "type": "thinking_step",
-                "status": "done",
-                "text": forced_step_text,
-            }
         if not final_text:
             final_text = "I can help with compatibility, troubleshooting, installation, or part search."
-        yield {"type": "token", "content": final_text}
+        for chunk in self._iter_text_chunks(final_text):
+            yield {"type": "token", "content": chunk}
         intent = self._infer_intent_from_tools(tool_names_used) if tool_names_used else self._infer_intent_from_message(message)
         confidence = 0.82 if tool_names_used else 0.62
         if compatibility_confirmed:

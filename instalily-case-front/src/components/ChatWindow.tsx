@@ -170,6 +170,7 @@ export default function ChatWindow({
     const newMessages = [...messages, userMessage, assistantMessage];
     const assistantIndex = newMessages.length - 1;
     setMessages(newMessages);
+    setCollapsedThinking((prev) => ({ ...prev, [assistantIndex]: false }));
 
     const userQuery = normalizedInput;
     setInput("");
@@ -258,7 +259,6 @@ export default function ChatWindow({
           onToken: (chunk) => {
             if (answerText.length === 0 && chunk) {
               thoughtSecondsAtFirstToken = Math.max(1, Math.round((Date.now() - thinkingStartedAt) / 1000));
-              setCollapsedThinking((prev) => ({ ...prev, [assistantIndex]: true }));
               updateAssistant({ thinkingDurationSeconds: thoughtSecondsAtFirstToken });
             }
             answerText += chunk || "";
@@ -285,6 +285,7 @@ export default function ChatWindow({
               thinkingDomains: domains,
               thinkingDurationSeconds: seconds,
             });
+            setCollapsedThinking((prev) => ({ ...prev, [assistantIndex]: true }));
           },
         },
         { runId, signal: controller.signal }
