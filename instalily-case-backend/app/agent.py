@@ -502,6 +502,7 @@ class MainAgent:
         live_empty = False
         compatibility_confirmed = False
         final_text = ""
+        draft_answer = ""
         n_calls = 0
         trajectory: List[Dict[str, Any]] = []
         tool_context_lines: List[str] = []
@@ -581,7 +582,7 @@ class MainAgent:
                 trajectory.append(assistant_message)
 
                 if not tool_calls:
-                    final_text = content.strip()
+                    draft_answer = content.strip()
                     raise Submitted(
                         {
                             "role": "exit",
@@ -746,10 +747,50 @@ class MainAgent:
             yield {"type": "done", "status": "cancelled", "intent": "general_parts_help", "confidence": 0.0, "citations": [], "traces": [t.model_dump() for t in traces]}
             self._clear_cancelled(run_id)
             return
-        if not final_text:
-            final_text = "I can help with compatibility, troubleshooting, installation, or part search."
-        for chunk in self._iter_text_chunks(final_text):
-            yield {"type": "token", "content": chunk}
+
+        saw_output = False
+        synthesis_prompt = (
+            "User request:\n"
+            f"{message}\n\n"
+            "Tool history from this run:\n"
+            + ("\n".join(tool_context_lines[-12:]) if tool_context_lines else "- none")
+            + "\n\n"
+            "Candidate source URLs:\n"
+            + ("\n".join([f"- {c.url}" for c in self._ensure_citations(citations)[:8]]) if citations else "- none")
+            + "\n\n"
+            "Draft answer (if any):\n"
+            + (draft_answer or "- none")
+            + "\n\n"
+            "Write the final user-facing answer. Be concise and factual."
+        )
+        try:
+            stream = self.client.responses.create(
+                model=settings.openai_model,
+                instructions=SYSTEM_TEMPLATE,
+                input=synthesis_prompt,
+                stream=True,
+                temperature=0.2,
+                timeout=45.0,
+            )
+            for event in stream:
+                etype = getattr(event, "type", "")
+                if etype == "response.output_text.delta":
+                    delta = getattr(event, "delta", "") or ""
+                    if delta:
+                        saw_output = True
+                        final_text += delta
+                        yield {"type": "token", "content": delta}
+        except Exception:
+            pass
+
+        if not saw_output:
+            if draft_answer:
+                final_text = draft_answer
+            elif not final_text:
+                final_text = "I can help with compatibility, troubleshooting, installation, or part search."
+            for chunk in self._iter_text_chunks(final_text):
+                yield {"type": "token", "content": chunk}
+
         intent = self._infer_intent_from_tools(tool_names_used) if tool_names_used else self._infer_intent_from_message(message)
         confidence = 0.82 if tool_names_used else 0.62
         if compatibility_confirmed:
