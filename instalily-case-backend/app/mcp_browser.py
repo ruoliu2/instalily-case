@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import quote_plus, urljoin, urlparse, urlunparse
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -42,24 +42,33 @@ class MCPBrowserRunner:
                         "score": 1.0,
                     }
                 )
-                frontier.extend(self._extract_candidate_links(snapshot, start_url))
+                frontier.extend(self._extract_candidate_links(snapshot, start_url, query=query))
 
-                if query and len(docs) < max_pages:
+                if query and len(docs) < hard_cap:
                     submitted = await self._submit_query_via_form(session, tools, query, snapshot)
-                    if submitted:
-                        snapshot2 = await self._snapshot_text(session, tools)
-                        url2 = self._extract_page_url(snapshot2) or docs[0]["url"]
-                        if url2 not in seen_urls:
-                            seen_urls.add(url2)
-                            docs.append(
-                                {
-                                    "url": url2,
-                                    "title": self._extract_page_title(snapshot2) or "Live MCP search result",
-                                    "text": snapshot2[:4000],
-                                    "score": 0.9,
-                                }
-                            )
-                        frontier.extend(self._extract_candidate_links(snapshot2, url2))
+                    if not submitted:
+                        # Fallback path: keep automation in-browser by opening PartSelect search results directly.
+                        search_url = f"https://www.partselect.com/Search.htm?SearchTerm={quote_plus(query)}"
+                        await self._call_tool(
+                            session,
+                            tools,
+                            ["browser_navigate", "navigate"],
+                            {"url": search_url},
+                            swallow=True,
+                        )
+                    snapshot2 = await self._snapshot_text(session, tools)
+                    url2 = self._extract_page_url(snapshot2) or docs[0]["url"]
+                    if url2 not in seen_urls:
+                        seen_urls.add(url2)
+                        docs.append(
+                            {
+                                "url": url2,
+                                "title": self._extract_page_title(snapshot2) or "Live MCP search result",
+                                "text": snapshot2[:4000],
+                                "score": 0.9,
+                            }
+                        )
+                    frontier.extend(self._extract_candidate_links(snapshot2, url2, query=query))
 
                 while frontier and len(docs) < hard_cap:
                     next_url = frontier.pop(0)
@@ -82,7 +91,7 @@ class MCPBrowserRunner:
                             "score": score,
                         }
                     )
-                    for link in self._extract_candidate_links(snapshot_n, curr_url):
+                    for link in self._extract_candidate_links(snapshot_n, curr_url, query=query):
                         if link not in seen_urls and link not in frontier:
                             frontier.append(link)
 
@@ -183,9 +192,11 @@ class MCPBrowserRunner:
         except Exception:
             return False
 
-    def _extract_candidate_links(self, snapshot_text: str, base_url: str) -> list[str]:
+    def _extract_candidate_links(self, snapshot_text: str, base_url: str, query: str = "") -> list[str]:
         out: list[str] = []
         seen: set[str] = set()
+        query_token = str(query or "").strip().upper()
+        part_token = query_token if re.fullmatch(r"PS\d{5,}", query_token or "") else ""
         # Snapshot commonly contains yaml lines like "/url: /Models/..." or full URLs.
         for m in re.finditer(r"/url:\s*([^\s]+)", snapshot_text or ""):
             raw = m.group(1).strip().strip('"').strip("'")
@@ -204,6 +215,8 @@ class MCPBrowserRunner:
         def score(u: str) -> int:
             low = u.lower()
             s = 0
+            if part_token and part_token.lower() in low:
+                s += 12
             if "/ps" in low:
                 s += 10
             if "/models/" in low:

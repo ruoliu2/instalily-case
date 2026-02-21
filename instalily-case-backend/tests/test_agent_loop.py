@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 
 from app.agent import MainAgent
-from app.models import CompatibilityResult
+from app.models import CompatibilityResult, RetrievedDoc
 from app.retrieval import SampleRepository
 from app.config import settings
 
@@ -32,7 +32,11 @@ class _FakeCompletions:
         self._idx = 0
 
     def create(self, **kwargs):
-        msg = self._messages[self._idx]
+        if not self._messages:
+            msg = SimpleNamespace(content="", tool_calls=[])
+        else:
+            idx = min(self._idx, len(self._messages) - 1)
+            msg = self._messages[idx]
         self._idx += 1
         return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
 
@@ -45,6 +49,10 @@ class _FakeClient:
 
 
 class _FakeToolbox:
+    def __init__(self, crawl_docs: list[RetrievedDoc] | None = None):
+        self.crawl_docs = list(crawl_docs or [])
+        self.crawl_calls: list[dict] = []
+
     @staticmethod
     def tool_schemas() -> list[dict]:
         return [
@@ -82,8 +90,7 @@ class _FakeToolbox:
             },
         ]
 
-    @staticmethod
-    def check_part_compatibility(model_number: str, partselect_number: str) -> CompatibilityResult:
+    def check_part_compatibility(self, model_number: str, partselect_number: str) -> CompatibilityResult:
         return CompatibilityResult(
             model_number=model_number,
             partselect_number=partselect_number,
@@ -92,15 +99,24 @@ class _FakeToolbox:
             source_url=f"https://www.partselect.com/Models/{model_number}/",
         )
 
-    @staticmethod
-    def crawl_partselect_live(url: str, model_number: str = "", query: str = "", max_pages: int = 2):
-        return []
+    def crawl_partselect_live(
+        self, url: str, model_number: str = "", query: str = "", max_pages: int = 2
+    ):
+        self.crawl_calls.append(
+            {
+                "url": url,
+                "model_number": model_number,
+                "query": query,
+                "max_pages": max_pages,
+            }
+        )
+        return list(self.crawl_docs)
 
 
 class AgentLoopTests(unittest.TestCase):
-    def _agent(self) -> MainAgent:
+    def _agent(self, toolbox: _FakeToolbox | None = None) -> MainAgent:
         repo = SampleRepository(settings.sample_dir)
-        return MainAgent(repo, _FakeToolbox())
+        return MainAgent(repo, toolbox or _FakeToolbox())
 
     def test_normalize_partselect_live_args_uses_safe_defaults(self):
         message = "live check model WDT780SAEM1 part PS3406971"
@@ -109,7 +125,44 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(got["url"], "https://www.partselect.com/")
         self.assertEqual(got["model_number"], "WDT780SAEM1")
         self.assertEqual(got["query"], "PS3406971")
-        self.assertEqual(got["max_pages"], 5)
+        self.assertEqual(got["max_pages"], 3)
+
+    def test_normalize_partselect_live_args_tokenizes_phrase_query(self):
+        message = "How can I install part number PS11752778?"
+        raw = {
+            "url": "https://www.partselect.com/",
+            "query": "PS11752778 installation PDF",
+            "max_pages": 1,
+        }
+        got = MainAgent._normalize_partselect_live_args(raw, message)
+        self.assertEqual(got["query"], "PS11752778")
+        self.assertEqual(got["max_pages"], 3)
+
+    def test_normalize_partselect_live_args_ignores_spurious_model_for_part_lookup(self):
+        message = "How can I install part number PS11752778?"
+        raw = {
+            "url": "https://www.partselect.com/PS11752778-Whirlpool-WPW10321304-Refrigerator-Door-Shelf-Bin.htm",
+            "model_number": "WPW10321304",
+            "query": "install",
+            "max_pages": 1,
+        }
+        got = MainAgent._normalize_partselect_live_args(raw, message)
+        self.assertEqual(got["query"], "PS11752778")
+        self.assertEqual(got["model_number"], "")
+        self.assertEqual(got["max_pages"], 3)
+
+    def test_crawl_call_key_dedupes_same_target_even_if_query_phrase_differs(self):
+        k1 = MainAgent._crawl_call_key(
+            {"url": "https://www.partselect.com/", "query": "PS11752778", "model_number": ""}
+        )
+        k2 = MainAgent._crawl_call_key(
+            {
+                "url": "https://www.partselect.com/",
+                "query": "PS11752778 installation PDF",
+                "model_number": "",
+            }
+        )
+        self.assertEqual(k1, k2)
 
     def test_run_stream_finishes_without_forced_live_call(self):
         agent = self._agent()
@@ -153,7 +206,55 @@ class AgentLoopTests(unittest.TestCase):
         done = next(e for e in events if e.get("type") == "done")
         self.assertGreaterEqual(float(done.get("confidence", 0.0)), 0.9)
 
+    def test_install_question_with_part_does_not_force_live_lookup_when_llm_skips_tools(self):
+        toolbox = _FakeToolbox(
+            crawl_docs=[
+                RetrievedDoc(
+                    url="https://www.partselect.com/",
+                    title="PartSelect",
+                    text="Search page",
+                    score=1.0,
+                ),
+                RetrievedDoc(
+                    url="https://www.partselect.com/PS11752778-Whirlpool-WPW10321304-Refrigerator-Door-Shelf-Bin.htm?SourceCode=3&SearchTerm=PS11752778",
+                    title="PS11752778",
+                    text="Installation Instructions",
+                    score=0.95,
+                ),
+            ]
+        )
+        agent = self._agent(toolbox=toolbox)
+        agent.client = _FakeClient(
+            [
+                SimpleNamespace(
+                    content=(
+                        "I'm not sure which appliance this is for. "
+                        "Can you share your model?"
+                    ),
+                    tool_calls=[],
+                ),
+                SimpleNamespace(content="Use the source link below.", tool_calls=[]),
+            ]
+        )
+        events = list(agent.run_stream("How can I install part number PS11752778?"))
+        self.assertEqual(len(toolbox.crawl_calls), 0)
+        self.assertTrue(any(e.get("type") == "done" for e in events))
+
+    def test_compatibility_missing_part_prompts_for_part_number(self):
+        agent = self._agent()
+        agent.client = _FakeClient([SimpleNamespace(content="I can help with that.", tool_calls=[])])
+        reply = agent.run_sync_from_stream("Is this part compatible with my WDT780SAEM1 model?")
+        self.assertIn("part number", reply.answer.lower())
+
+    def test_refrigerator_troubleshooting_missing_model_prompts_for_model_or_brand(self):
+        agent = self._agent()
+        agent.client = _FakeClient([SimpleNamespace(content="Try resetting the unit.", tool_calls=[])])
+        reply = agent.run_sync_from_stream(
+            "The ice maker on my Whirlpool fridge is not working. How can I fix it?"
+        )
+        lower = reply.answer.lower()
+        self.assertTrue("model number" in lower or "brand" in lower)
+
 
 if __name__ == "__main__":
     unittest.main()
-

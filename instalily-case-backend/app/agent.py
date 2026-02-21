@@ -93,30 +93,42 @@ class MainAgent:
             safe["url"] = "https://www.partselect.com/"
 
         model = str(safe.get("model_number", "")).strip().upper()
+        msg_model = MainAgent._extract_model_number(message)
         if not model:
-            model = MainAgent._extract_model_number(message)
+            model = msg_model
             if model:
                 safe["model_number"] = model
 
-        # If model is known, anchor to canonical model page unless URL is already a model/part detail page.
-        current_url_raw = str(safe.get("url", "")).strip()
-        current_url = current_url_raw.lower()
-        model_token = model.lower()
-        looks_model_page = f"/models/{model_token}/" in current_url or f"/models/{model_token}" in current_url
-        looks_part_page = "/ps" in current_url and current_url.endswith(".htm")
-        if model and not looks_model_page and not looks_part_page:
-            safe["url"] = f"https://www.partselect.com/Models/{model}/"
-
+        # Keep query tokenized for PartSelect search UX (part/model ID token only).
         query = str(safe.get("query", "")).strip()
-        if not query:
-            part = MainAgent._extract_partselect_number(message)
-            safe["query"] = part or model or message
+        token_from_query = MainAgent._extract_partselect_number(query) or MainAgent._extract_model_number(query)
+        token_from_message = MainAgent._extract_partselect_number(message) or MainAgent._extract_model_number(message)
+        resolved_query = token_from_query or token_from_message or model
+        if resolved_query:
+            safe["query"] = resolved_query
+        elif query:
+            safe["query"] = query
+        else:
+            safe["query"] = message
+
+        normalized_query = str(safe.get("query", "")).strip()
+        if " " in normalized_query and model:
+            safe["query"] = model
+
+        part_for_query = MainAgent._extract_partselect_number(str(safe.get("query", "")) or message)
+        if part_for_query and not msg_model:
+            # Avoid drifting into manufacturer part numbers as "model_number" for PS part lookup flows.
+            safe["model_number"] = ""
 
         try:
-            mp = int(safe.get("max_pages", 2))
+            default_pages = 4 if part_for_query else 2
+            mp = int(safe.get("max_pages", default_pages))
         except Exception:
-            mp = 2
-        safe["max_pages"] = max(1, min(mp, 6))
+            mp = 4 if part_for_query else 2
+        if part_for_query:
+            safe["max_pages"] = 3
+            return safe
+        safe["max_pages"] = max(1, min(mp, 5))
         return safe
 
     @staticmethod
@@ -232,10 +244,36 @@ class MainAgent:
 
     @staticmethod
     def _crawl_call_key(args: Dict[str, Any]) -> str:
-        url = str(args.get("url", "")).strip().lower()
+        url = str(args.get("url", "")).strip()
         model = str(args.get("model_number", "")).strip().upper()
-        query = str(args.get("query", "")).strip().upper()
-        return f"url={url}|model={model}|query={query}"
+        query = str(args.get("query", "")).strip()
+        target = (
+            MainAgent._extract_partselect_number(query)
+            or MainAgent._extract_partselect_number(url)
+            or MainAgent._extract_model_number(query)
+            or model
+            or MainAgent._extract_model_number(url)
+        )
+        if target:
+            return f"target={target.upper()}"
+        return f"url={url.lower()}|query={query.upper()}"
+
+    @staticmethod
+    def _extract_target_from_call_key(call_key: str) -> str:
+        raw = str(call_key or "").strip()
+        if raw.startswith("target="):
+            return raw.split("=", 1)[1].strip().upper()
+        return ""
+
+    @staticmethod
+    def _citations_contain_token(citations: List[Citation], token: str) -> bool:
+        t = str(token or "").strip().upper()
+        if not t:
+            return False
+        for c in citations:
+            if t in str(c.url or "").upper():
+                return True
+        return False
 
     @staticmethod
     def _crawl_query_hint_from_payload(payload: Dict[str, Any]) -> str:
@@ -390,6 +428,87 @@ class MainAgent:
         if any(tok in m for tok in ["ps", "model", "compatible", "install", "replace", "symptom", "drain", "broken", "dishwasher", "refrigerator"]):
             return True
         return any(ch.isdigit() for ch in m)
+
+    @classmethod
+    def _policy_state(
+        cls,
+        *,
+        message: str,
+        draft_answer: str = "",
+        tool_names_used: List[str] | None = None,
+        citations: List[Citation] | None = None,
+    ) -> Dict[str, Any]:
+        model_number = cls._extract_model_number(message)
+        part_number = cls._extract_partselect_number(message)
+        url = cls._extract_url(message)
+        draft_lower = (draft_answer or "").lower()
+        tools = tool_names_used or []
+        cites = citations or []
+        return {
+            "intent": cls._infer_intent_from_message(message),
+            "model_number": model_number,
+            "part_number": part_number,
+            "url": url,
+            "has_model_number": bool(model_number),
+            "has_part_number": bool(part_number),
+            "has_url": bool(url),
+            "has_live_lookup_tool": "crawl_partselect_live" in tools,
+            "has_citations": len(cites) > 0,
+            "draft_lower": draft_lower,
+        }
+
+    @classmethod
+    def _policy_follow_up_question(
+        cls,
+        *,
+        message: str,
+        draft_answer: str = "",
+        tool_names_used: List[str] | None = None,
+        citations: List[Citation] | None = None,
+    ) -> str:
+        state = cls._policy_state(
+            message=message,
+            draft_answer=draft_answer,
+            tool_names_used=tool_names_used,
+            citations=citations,
+        )
+        intent = str(state.get("intent", ""))
+        draft = str(state.get("draft_lower", ""))
+        has_model = bool(state.get("has_model_number"))
+        has_part = bool(state.get("has_part_number"))
+        has_url = bool(state.get("has_url"))
+
+        if intent == "compatibility":
+            if not has_part and "part number" not in draft:
+                return (
+                    "Can you provide the part number (for example, PS3406971) "
+                    "so I can check compatibility?"
+                )
+            if not has_model and "model number" not in draft:
+                return (
+                    "Can you provide the appliance model number (for example, WDT780SAEM1) "
+                    "so I can check compatibility?"
+                )
+            return ""
+
+        if intent == "installation":
+            if not (has_part or has_model or has_url):
+                if any(tok in draft for tok in ["part number", "model number", "link", "url"]):
+                    return ""
+                return (
+                    "Can you provide the part number, appliance model number, or a PartSelect page link "
+                    "so I can find the right installation instructions?"
+                )
+            return ""
+
+        if intent == "troubleshoot":
+            if not has_model and "model number" not in draft:
+                return (
+                    "Can you provide the appliance model number so I can give accurate troubleshooting steps?"
+                )
+            return ""
+
+        return ""
 
     @staticmethod
     def _fallback_title(history: List[Dict[str, Any]]) -> str:
@@ -592,6 +711,8 @@ class MainAgent:
         crawled_urls_in_run: set[str] = set()
         repeated_same_crawl_call = 0
         last_crawl_call_key = ""
+        crawl_call_counts: Dict[str, int] = {}
+        force_direct_draft = False
 
         messages: List[Dict[str, Any]] = self._build_messages(message, history)
         trajectory.extend(messages)
@@ -622,6 +743,11 @@ class MainAgent:
                     "text": decision_step_text,
                 }
 
+                policy_state_now = self._policy_state(
+                    message=message,
+                    tool_names_used=tool_names_used,
+                    citations=citations,
+                )
                 loop_context = (
                     "Tool history for this run:\n"
                     + ("\n".join(tool_context_lines[-8:]) if tool_context_lines else "- none yet")
@@ -631,13 +757,20 @@ class MainAgent:
                     + "1) Read tool history before deciding.\n"
                     + "2) Do not call the same tool with the same args again unless prior result was explicitly insufficient.\n"
                     + "3) If compatibility and at least one source are already available, answer directly.\n"
-                    + "4) If tool history indicates input_hint=search box expects part/model id token, "
-                    + "use query as a single model or part id (e.g., WDT780SAEM1 or PS3406971), not a phrase.\n"
+                    + "4) For crawl_partselect_live, use query as a single model or part id token "
+                    + "(e.g., WDT780SAEM1 or PS3406971), not a phrase.\n"
                     + "5) For pagination/navigation, prefer URLs discovered in this run; do not invent ?page=N paths.\n"
                     + f"6) Progress signal: repeated_no_new_info={repeated_no_new_info}, repeated_same_crawl_call={repeated_same_crawl_call}. "
                     + "If either is >=2, stop tool calls and provide best final answer from gathered sources.\n"
                     + "7) After each tool result, explicitly decide continue-vs-stop. "
-                    + "If stopping, provide a brief reason that evidence is sufficient, then answer."
+                    + "If stopping, provide a brief reason that evidence is sufficient, then answer.\n"
+                    + "8) Apply policy rules: required slots and required tool usage before final answer.\n"
+                    + "9) If policy requires a follow-up question, ask one concise targeted follow-up.\n"
+                    + "10) If policy requires a live lookup first, call crawl_partselect_live.\n"
+                    + "11) If you already found a relevant part page URL for the target ID, stop crawling and answer.\n"
+                    + "\nDetected entities:\n"
+                    + f"- model_number={str(policy_state_now.get('model_number') or 'missing')}\n"
+                    + f"- part_number={str(policy_state_now.get('part_number') or 'missing')}"
                 )
                 resp = self.client.chat.completions.create(
                     model=settings.openai_model,
@@ -676,6 +809,16 @@ class MainAgent:
 
                 if not tool_calls:
                     draft_answer = content.strip()
+                    follow_up = self._policy_follow_up_question(
+                        message=message,
+                        draft_answer=draft_answer,
+                        tool_names_used=tool_names_used,
+                        citations=citations,
+                    )
+                    if follow_up:
+                        draft_answer = follow_up
+                        final_text = follow_up
+                        force_direct_draft = True
                     raise Submitted(
                         {
                             "role": "exit",
@@ -700,12 +843,12 @@ class MainAgent:
                         "text": tool_step_text,
                         "domain": "www.partselect.com",
                     }
-                    yield {
-                        "type": "thinking_token",
-                        "content": self._tool_call_debug_text(name, args),
-                    }
 
                     if name == "check_part_compatibility":
+                        yield {
+                            "type": "thinking_token",
+                            "content": self._tool_call_debug_text(name, args),
+                        }
                         before_urls = set(seen_citation_urls)
                         result = self.tools.check_part_compatibility(
                             model_number=str(args.get("model_number", "")),
@@ -724,6 +867,10 @@ class MainAgent:
                             seen_citation_urls.add(str(payload["source_url"]))
                         new_info = seen_citation_urls != before_urls
                     elif name == "search_partselect_content":
+                        yield {
+                            "type": "thinking_token",
+                            "content": self._tool_call_debug_text(name, args),
+                        }
                         before_urls = set(seen_citation_urls)
                         docs = self.tools.search_partselect_content(
                             query=str(args.get("query", message)),
@@ -744,7 +891,12 @@ class MainAgent:
                         before_urls = set(seen_citation_urls)
                         used_live_tool = True
                         args = self._normalize_partselect_live_args(args, message)
+                        yield {
+                            "type": "thinking_token",
+                            "content": self._tool_call_debug_text(name, args),
+                        }
                         call_key = self._crawl_call_key(args)
+                        crawl_call_counts[call_key] = crawl_call_counts.get(call_key, 0) + 1
                         docs = self.tools.crawl_partselect_live(
                             url=str(args.get("url", "https://www.partselect.com/")),
                             model_number=str(args.get("model_number", "")),
@@ -784,7 +936,25 @@ class MainAgent:
                         else:
                             repeated_same_crawl_call = 0
                         last_crawl_call_key = call_key
+
+                        target = self._extract_target_from_call_key(call_key)
+                        if (
+                            target
+                            and crawl_call_counts.get(call_key, 0) >= 2
+                            and self._citations_contain_token(self._ensure_citations(citations), target)
+                        ):
+                            raise Submitted(
+                                {
+                                    "role": "exit",
+                                    "content": "Submitted",
+                                    "extra": {"exit_status": "Submitted"},
+                                }
+                            )
                     else:
+                        yield {
+                            "type": "thinking_token",
+                            "content": self._tool_call_debug_text(name, args),
+                        }
                         payload = {"error": f"unknown_tool:{name}"}
                         new_info = False
 
@@ -874,27 +1044,32 @@ class MainAgent:
             + (", ".join(allowed_part_ids[:120]) if allowed_part_ids else "none")
             + "\n\n"
             "Write the final user-facing answer. Be concise and factual. "
-            "Do not invent part numbers. Only mention part numbers if they are in Allowed part IDs."
+            "Do not invent part numbers. Only mention part numbers if they are in Allowed part IDs. "
+            "If this is an installation request with a PS part number and a matching /PS... source URL exists, "
+            "include that URL explicitly in the answer. "
+            "If this is a compatibility request missing a part number, ask for part number. "
+            "If this is refrigerator troubleshooting without model details, ask for model number or brand."
         )
-        try:
-            stream = self.client.responses.create(
-                model=settings.openai_model,
-                instructions=SYSTEM_TEMPLATE,
-                input=synthesis_prompt,
-                stream=True,
-                temperature=0.2,
-                timeout=45.0,
-            )
-            for event in stream:
-                etype = getattr(event, "type", "")
-                if etype == "response.output_text.delta":
-                    delta = getattr(event, "delta", "") or ""
-                    if delta:
-                        saw_output = True
-                        final_text += delta
-                        yield {"type": "token", "content": delta}
-        except Exception:
-            pass
+        if not force_direct_draft:
+            try:
+                stream = self.client.responses.create(
+                    model=settings.openai_model,
+                    instructions=SYSTEM_TEMPLATE,
+                    input=synthesis_prompt,
+                    stream=True,
+                    temperature=0.2,
+                    timeout=45.0,
+                )
+                for event in stream:
+                    etype = getattr(event, "type", "")
+                    if etype == "response.output_text.delta":
+                        delta = getattr(event, "delta", "") or ""
+                        if delta:
+                            saw_output = True
+                            final_text += delta
+                            yield {"type": "token", "content": delta}
+            except Exception:
+                pass
 
         if not saw_output:
             if draft_answer:
